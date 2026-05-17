@@ -150,18 +150,38 @@ class SplashWindow(QWidget):
         if self._done:
             return
         self._done = True
-        try:
-            self._blink.stop()
-            self._kill_timer.stop()
-            self._duration_timer.stop()
-        except Exception:
-            pass
+        # Stop blink / safety timers first so they cannot re-fire mid-teardown
+        for t in (self._blink, self._kill_timer, self._duration_timer):
+            try:
+                t.stop()
+            except Exception:
+                pass
+        # Tear the player down deterministically: stop, drop video/audio
+        # outputs, then clear the source. Without this, Qt may try to push
+        # frames into a widget that's mid-destruction → crash.
         try:
             self.player.stop()
+            self.player.setVideoOutput(None)
+            self.player.setAudioOutput(None)
+            self.player.setSource(QUrl())
         except Exception:
             pass
+        # Disconnect every player signal so a late callback can't fire after
+        # the SplashWindow is deleted.
+        for sig in (self.player.mediaStatusChanged,
+                    self.player.positionChanged,
+                    self.player.durationChanged,
+                    self.player.errorOccurred):
+            try:
+                sig.disconnect()
+            except Exception:
+                pass
         self.finished.emit()
-        self.close()
+        # Defer hide + delete to the next event-loop tick so the current
+        # signal/event handler can fully unwind before Qt destroys this widget
+        # (and the player/audio output owned by it).
+        QTimer.singleShot(0, self.hide)
+        QTimer.singleShot(0, self.deleteLater)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         self._emit_finished()

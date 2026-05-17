@@ -79,7 +79,10 @@ class MainWindow(QMainWindow):
         self.brand_banner = BrandBanner(self)
         self.brand_banner.show()
 
-        # Background music: 3 looping OpenSource tracks. Starts at saved state.
+        # Background music: 3 looping OpenSource tracks. Construct now (cheap),
+        # but DEFER starting until start_music() is called from app.py after the
+        # splash finishes. Two simultaneous QMediaPlayer instances racing during
+        # splash teardown was causing GUI crashes on skip / video end.
         from fd6.gui.music import MusicPlayer
         self.music = MusicPlayer(self)
         self.music.state_changed.connect(self._on_music_state)
@@ -88,17 +91,24 @@ class MainWindow(QMainWindow):
         self.music.track_changed.connect(
             lambda name: self.statusBar().showMessage(f"♪ {name}", 4000)
         )
-        if self.music.has_tracks():
-            self.music.start()
-            self._music_play_act.setChecked(self.music.is_playing())
-            self._music_mute_act.setChecked(self.music.muted())
-            self._sync_volume_check(self.music.volume())
-        else:
-            # No bundled MP3s — disable music controls cleanly
+        if not self.music.has_tracks():
             for act in (self._music_play_act, self._music_mute_act):
                 act.setEnabled(False)
             for act in self._music_vol_group.actions():
                 act.setEnabled(False)
+
+    def start_music(self) -> None:
+        """Begin background music. Call once, after the splash has finished, to
+        avoid two QMediaPlayer audio streams colliding during splash teardown."""
+        if not getattr(self, "music", None) or not self.music.has_tracks():
+            return
+        if getattr(self, "_music_started", False):
+            return
+        self._music_started = True
+        self.music.start()
+        self._music_play_act.setChecked(self.music.is_playing())
+        self._music_mute_act.setChecked(self.music.muted())
+        self._sync_volume_check(self.music.volume())
 
     def _apply_dark_palette(self) -> None:
         # Theme styling now lives in fd6/gui/themes.py and is applied at QApplication level.

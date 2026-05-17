@@ -25,6 +25,11 @@ def main() -> int:
 
     def show_main():
         win.show()
+        # Defer music start by one event-loop tick so any splash teardown
+        # finishes first (two simultaneous QMediaPlayer streams during splash
+        # close was crashing the app).
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(150, win.start_music)
 
     # Show splash if SplashScreen.mp4 is present, then open main window when video ends or user clicks/keypress.
     # If no splash file, show main window immediately.
