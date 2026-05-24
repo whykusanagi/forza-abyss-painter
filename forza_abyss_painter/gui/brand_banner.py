@@ -112,36 +112,28 @@ class BrandBanner(QWidget):
         self.whyk_btn.setCursor(Qt.PointingHandCursor)
         self.whyk_btn.setFixedHeight(self.CTA_HEIGHT)
         self.whyk_btn.setStyleSheet(
+            # Abyss accent — magenta (Corrupted Theme primary), white text
             "QPushButton {"
-            " background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
-            "  stop:0 #ff0000, stop:0.166 #ff8800, stop:0.333 #ffff00,"
-            "  stop:0.5 #00ff00, stop:0.666 #00ffff, stop:0.833 #8800ff,"
-            "  stop:1 #ff00ff);"
-            " color: #000000; font-weight: bold; letter-spacing: 1px;"
-            " border: 1px solid #000; border-radius: 6px; padding: 0 10px; }"
+            " background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
+            "  stop:0 #e86ca8, stop:0.5 #d94f90, stop:1 #b61b70);"
+            " color: #ffffff; font-weight: bold; letter-spacing: 1px;"
+            " border: 1px solid #3a2555; border-radius: 6px; padding: 0 10px; }"
             "QPushButton:hover { border-color: #fff; }"
         )
         self.whyk_btn.setToolTip("Open whykusanagi.xyz")
         self.whyk_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(WHYKUSANAGI_URL)))
         outer.addWidget(self.whyk_btn)
 
-        # ── CTA 2: GitHub project link (tan -> brown, sand text) ────────────
+        # ── CTA 2: GitHub project link (GitHub-style — pure black bg, white text) ──
         self.project_btn = QPushButton("  GitHub: forza-abyss-painter", self.panel)
         self.project_btn.setCursor(Qt.PointingHandCursor)
         self.project_btn.setFixedHeight(self.CTA_HEIGHT)
-        jba_logo = None   # JBA emulator icon removed; button is now a GitHub link with no icon
-        if jba_logo:
-            jba_pix = QPixmap(str(jba_logo))
-            if not jba_pix.isNull():
-                self.project_btn.setIcon(QIcon(jba_pix.scaled(20, 20, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
-                self.project_btn.setIconSize(QSize(20, 20))
         self.project_btn.setStyleSheet(
             "QPushButton {"
-            " background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
-            "  stop:0 #e6c79e, stop:0.5 #a47148, stop:1 #5b3a1e);"
-            " color: #f4e4bc; font-weight: bold; letter-spacing: 0.5px;"
-            " border: 1px solid #3d2412; border-radius: 6px; padding: 0 10px; text-align: left; }"
-            "QPushButton:hover { border-color: #fff8e1; }"
+            " background: #0d1117;"   # GitHub's signature near-black
+            " color: #ffffff; font-weight: bold; letter-spacing: 0.5px;"
+            " border: 1px solid #30363d; border-radius: 6px; padding: 0 10px; text-align: left; }"
+            "QPushButton:hover { border-color: #ffffff; background: #161b22; }"
         )
         self.project_btn.setToolTip(f"Open the GitHub project ({PROJECT_URL})")
         self.project_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(PROJECT_URL)))
@@ -165,16 +157,17 @@ class BrandBanner(QWidget):
         self.tutorial_btn.clicked.connect(self._on_tutorial_clicked)
         outer.addWidget(self.tutorial_btn)
 
-        # ── CTA 3: Watch on Twitch (matches site .btn-discord orange) ───────
-        self.twitch_btn = QPushButton("Watch on Twitch"), self.panel)
+        # ── CTA 4: Watch on Twitch (Corrupted Theme purple gradient) ────────
+        self.twitch_btn = QPushButton("Watch on Twitch", self.panel)
         self.twitch_btn.setCursor(Qt.PointingHandCursor)
         self.twitch_btn.setFixedHeight(self.CTA_HEIGHT)
         self.twitch_btn.setStyleSheet(
+            # Abyss purple — gradient-purple stops from variables.css
             "QPushButton {"
             " background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
-            "  stop:0 #ffd9a8, stop:0.4 #ff8c1a, stop:1 #b35400);"
-            " color: #000000; font-weight: bold; letter-spacing: 0.5px;"
-            " border: 1px solid #6b3000; border-radius: 6px; padding: 0 10px; }"
+            "  stop:0 #a78bfa, stop:0.5 #8b5cf6, stop:1 #5b2a9e);"
+            " color: #ffffff; font-weight: bold; letter-spacing: 0.5px;"
+            " border: 1px solid #3a2555; border-radius: 6px; padding: 0 10px; }"
             "QPushButton:hover { border-color: #fff; }"
         )
         self.twitch_btn.setToolTip(f"Open the Twitch channel ({TWITCH_URL})")
