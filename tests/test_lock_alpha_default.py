@@ -37,20 +37,28 @@ def test_every_preset_locks_alpha_in_source_of_truth():
         )
 
 
-def test_every_production_notebook_ships_with_lock_alpha_true():
-    """Generated notebooks (the artifacts users actually upload to Colab) must have
-    LOCK_ALPHA = True in their Configure cell."""
+def test_every_production_notebook_hardcodes_lock_alpha_true_in_cfg():
+    """Generated notebooks must instantiate GPUConfig with `lock_alpha=True` HARDCODED —
+    NOT pulled from a user-editable LOCK_ALPHA knob in the Configure cell. v0.1.7
+    removed the knob entirely because lock_alpha is a hard system constraint of the
+    Forza injector (not a tunable). If anyone re-adds it as a Configure-cell knob,
+    this test fails."""
     for nb_path in sorted(REPO_ROOT.glob(NOTEBOOK_GLOB)):
         nb = json.loads(nb_path.read_text())
         src_all = "\n".join("".join(c.get("source", []))
                             for c in nb["cells"] if c["cell_type"] == "code")
-        m = re.search(r"LOCK_ALPHA\s*=\s*(True|False)", src_all)
-        assert m, f"{nb_path.name}: LOCK_ALPHA not defined in Configure cell"
-        assert m.group(1) == "True", (
-            f"{nb_path.name}: LOCK_ALPHA = {m.group(1)} in generated notebook. Must be True. "
-            f"Either the preset is missing lock_alpha:True or the builder's setdefault "
-            f"regressed to False — check forza_abyss_painter/shapegen/presets.py and "
-            f"notebooks/build_colab_notebook.py's cell_knobs() setdefault."
+        # The Configure cell must NOT define a user-editable LOCK_ALPHA knob.
+        assert not re.search(r"^\s*LOCK_ALPHA\s*=\s*(True|False)\s*$",
+                             src_all, re.MULTILINE), (
+            f"{nb_path.name}: LOCK_ALPHA is exposed as a user-editable knob. It must "
+            f"NOT be — lock_alpha is a system constraint, not a preference. The cfg "
+            f"instantiation should hardcode `lock_alpha=True` instead."
+        )
+        # The cfg instantiation must hardcode lock_alpha=True.
+        assert re.search(r"lock_alpha\s*=\s*True", src_all), (
+            f"{nb_path.name}: GPUConfig instantiation doesn't pass `lock_alpha=True`. "
+            f"This must be hardcoded (not pulled from a variable) so users can't set "
+            f"the invalid False value."
         )
 
 

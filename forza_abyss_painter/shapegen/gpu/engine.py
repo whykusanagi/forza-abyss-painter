@@ -106,11 +106,19 @@ class GPUConfig:
     # for future investigations into structured shape refinement). polish_purity_penalty
     # is a no-op when freeze_geometry=True (it's a geometry-affecting term).
     polish_freeze_geometry: bool = True
-    # Injector-safe modes — see docs/superpowers/specs/2026-05-22-alpha-injector-fix-design.md.
-    # lock_alpha: when True, every shape's alpha is forced to 255 throughout greedy + polish,
-    # matching the FH injector's binary-alpha constraint. ALPHA_LEVELS becomes [255]; the
-    # joint_polish alpha tensor isn't optimized.
-    lock_alpha: bool = False
+    # lock_alpha: HARD SYSTEM CONSTRAINT, NOT A USER PREFERENCE.
+    # The Forza injector writes alpha=255 to every layer at inject time — there's no way
+    # to ship a non-opaque shape into the game's vinyl group without modifying the EXE
+    # itself. A JSON generated with soft alpha (alpha_levels=[96,160,255]) renders one
+    # way in the notebook's engine preview and ANOTHER way in-game, breaking the entire
+    # promise that "what you see in the preview is what the game shows."
+    # Therefore False is not a supported value — it's a footgun. run_gpu validates this
+    # and raises ValueError if anyone passes False. Default stays True; tests that
+    # exercise the engine's old soft-alpha code path (test_joint_polish_lock.py) call
+    # the internal joint_polish() function directly with lock_alpha=False, bypassing the
+    # GPUConfig gate, because that function's behavior is still useful to characterize
+    # for diagnostic purposes — but the production pipeline cannot accept False.
+    lock_alpha: bool = True
     # prune_threshold: drop a shape if removing it changes full-canvas RMS by less than this
     # many uint8 units. 0.0 = no pruning. Currently unused by run_gpu; kept for forward-compat
     # with reprocess flows.
@@ -331,6 +339,20 @@ def run_gpu(
     If `progress_every > 0`, prints a progress line every that many committed shapes with
     rate, ETA, and current best RMS — useful for long Colab runs.
     """
+    # HARD SYSTEM CONSTRAINT — see GPUConfig.lock_alpha comment. The Forza injector
+    # writes alpha=255 unconditionally; a JSON generated with soft alpha is not
+    # representable in-game. Reject the invalid state at the API boundary so users
+    # can't silently ship a broken JSON.
+    if not cfg.lock_alpha:
+        raise ValueError(
+            "GPUConfig.lock_alpha must be True. The Forza injector writes alpha=255 "
+            "to every layer at inject time — there's no path to ship a soft-alpha JSON "
+            "into the game's vinyl group. A False value would generate a JSON whose "
+            "engine preview shows soft alpha but whose in-game render is fully opaque, "
+            "breaking the preview-matches-game contract. (If you're benchmarking the "
+            "old soft-alpha code path for diagnostic reasons, call joint_polish() "
+            "directly with lock_alpha=False instead of going through run_gpu.)"
+        )
     if target_rgb.ndim != 3 or target_rgb.shape[2] != 3 or target_rgb.dtype != np.uint8:
         raise ValueError("target_rgb must be (H, W, 3) uint8")
     if alpha_mask is not None:

@@ -200,9 +200,10 @@ ALPHA_THRESHOLD    = {alpha_threshold}      # 0 = keep soft alpha. If you see a 
                             # silhouette and drop the fringe. Raise to 160-200 if it persists.
 CHECKPOINT_EVERY   = {checkpoint_every}    # write a recoverable JSON to Drive every N shapes
                             # (survives a mid-run disconnect). 0 = off.
-LOCK_ALPHA         = {lock_alpha}    # True: every shape's alpha is forced to 255 (injector-safe).
-                                     # The FH injector flattens alpha at inject time; setting this
-                                     # ensures the engine PNG matches what the game will display.
+# NOTE: lock_alpha is NOT exposed as a user knob — it's a HARD SYSTEM CONSTRAINT.
+# The Forza injector writes alpha=255 unconditionally; soft-alpha JSONs would render
+# one way in this notebook's preview and another way in-game. run_gpu raises ValueError
+# if cfg.lock_alpha is False. Hardcoded True below in the cfg instantiation.
 POLISH_FREEZE_GEOMETRY = {polish_freeze_geometry}   # True (PRODUCTION DEFAULT): joint_polish refines
                                      # colors only, leaving shape geometry bit-identical to greedy.
                                      # Prevents the inflate/collapse exploits Adam was finding on
@@ -484,7 +485,7 @@ cfg = GPUConfig(
     grad_lr=GRAD_LR,
     mutation_rounds=MUTATION_ROUNDS,
     mutations_per_round=MUTATIONS_PER_ROUND,
-    lock_alpha=LOCK_ALPHA,
+    lock_alpha=True,   # SYSTEM CONSTRAINT — see notebook comment above. Not user-tunable.
     polish_freeze_geometry=POLISH_FREEZE_GEOMETRY,
 )
 import json
