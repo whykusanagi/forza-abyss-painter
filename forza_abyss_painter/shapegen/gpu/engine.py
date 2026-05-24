@@ -106,6 +106,15 @@ class GPUConfig:
     # for future investigations into structured shape refinement). polish_purity_penalty
     # is a no-op when freeze_geometry=True (it's a geometry-affecting term).
     polish_freeze_geometry: bool = True
+    # refill_dead_shapes: after greedy + joint_polish + snap-back, identify shapes whose
+    # visible-pixel count under z-order is below refill_min_visible_px (fully occluded by
+    # later commits = dead weight in the JSON). Drop them and run a mini-greedy targeting
+    # the current residual to commit the same number of NEW shapes back, then snap-back
+    # over the full set. User asked for num_shapes; gets num_shapes LIVE shapes instead
+    # of num_shapes commits with ~5% dead weight. Default True — strict quality improvement
+    # at the cost of one extra mini-greedy pass.
+    refill_dead_shapes: bool = True
+    refill_min_visible_px: int = 5
     # lock_alpha: HARD SYSTEM CONSTRAINT, NOT A USER PREFERENCE.
     # The Forza injector writes alpha=255 to every layer at inject time — there's no way
     # to ship a non-opaque shape into the game's vinyl group without modifying the EXE
@@ -559,6 +568,33 @@ def run_gpu(
             purity_penalty=cfg.polish_purity_penalty,
             freeze_geometry=cfg.polish_freeze_geometry,
         )
+        if cfg.refill_dead_shapes and shapes and all(s["type"] == "rotated_ellipse" for s in shapes):
+            from forza_abyss_painter.shapegen.gpu.refill import clean_and_refill
+            n_before = len(shapes)
+            shapes, canvas_np = clean_and_refill(
+                shapes, target, canvas, alpha_t, alpha_mask_f, edge_weight,
+                cfg, h, w, gen,
+            )
+            if progress_every:
+                n_refilled = len(shapes) - n_before if len(shapes) > n_before else 0
+                print(f"  refill: final {len(shapes)} live shapes "
+                      f"(detected dead + refilled {n_refilled} this pass)")
         return shapes, canvas_np
 
+    if cfg.refill_dead_shapes and shapes and all(s["type"] == "rotated_ellipse" for s in shapes):
+        # No-polish path: refill still runs because dead-shape detection works on greedy
+        # output directly (snap-back only matters if there was a polish to snap from; the
+        # refill path's internal snap-back handles either case). Multi-shape eval presets
+        # skip refill entirely — the mini-greedy commits ellipses only.
+        from forza_abyss_painter.shapegen.gpu.refill import clean_and_refill
+        n_before = len(shapes)
+        shapes, canvas_np = clean_and_refill(
+            shapes, target, canvas, alpha_t, alpha_mask_f, edge_weight,
+            cfg, h, w, gen,
+        )
+        if progress_every:
+            n_refilled = len(shapes) - n_before if len(shapes) > n_before else 0
+            print(f"  refill: final {len(shapes)} live shapes "
+                  f"(detected dead + refilled {n_refilled} this pass)")
+        return shapes, canvas_np
     return shapes, canvas.cpu().numpy()
