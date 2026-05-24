@@ -102,6 +102,10 @@ PRESETS = {
         "checkpoint_every": 250,
         "shape_types": '["rotated_ellipse", "triangle", "rotated_rectangle"]',
         "alpha_threshold": 0,
+        "lock_alpha": True,        # the injector forces binary alpha at write time; soft
+                                   # alpha makes the engine PNG diverge from in-game render.
+                                   # ALWAYS true regardless of whether the preset is currently
+                                   # injectable — the renderer-vs-injector contract is global.
     },
     "shapes_medium_1000": {
         "preset_label": "MEDIUM / 1000 shapes (multi-shape EVAL — not injectable yet)",
@@ -114,5 +118,6 @@ PRESETS = {
         "checkpoint_every": 100,
         "shape_types": '["rotated_ellipse", "triangle", "rotated_rectangle"]',
         "alpha_threshold": 0,
+        "lock_alpha": True,        # see shapes_highres_3000 note.
     },
 }

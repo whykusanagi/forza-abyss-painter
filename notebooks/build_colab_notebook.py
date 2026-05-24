@@ -234,7 +234,10 @@ print("Next: run the Resolution Planner to validate MAX_RESOLUTION against your 
 
 def cell_knobs(preset):
     p = dict(preset)
-    p.setdefault("lock_alpha", False)   # default False; ellipse presets set True explicitly
+    p.setdefault("lock_alpha", True)    # injector-safety default — the injector forces binary
+                                        # alpha at write time, so a False default would produce
+                                        # JSONs whose engine PNG renders differently than the
+                                        # game does. NEVER set False without explicit reason.
     p.setdefault("polish_freeze_geometry", True)    # production default; multi-shape eval presets
                                                      # don't run polish so it's moot for them either way
     return _KNOBS_TMPL.format(**p)
