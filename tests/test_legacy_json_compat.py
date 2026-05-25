@@ -252,3 +252,45 @@ def test_legacy_erebus_nihilister_loads_end_to_end():
     # All drawables are rotated_ellipse in this file.
     from forza_abyss_painter.shapegen.shapes.ellipse import RotatedEllipse
     assert all(isinstance(s, RotatedEllipse) for s in shapes)
+
+
+@pytest.mark.skipif(not os.path.exists(_EREBUS_PATH),
+                    reason="erebus nihilister fixture not present in this env")
+def test_legacy_erebus_nihilister_byte_identical_to_painter_interpretation():
+    """Per-shape fidelity audit against painter's interpretation. For every
+    one of the 1000 drawables in the file, our materialized Shape MUST carry
+    the exact same x, y, rx, ry, angle, color as painter would (painter
+    passes data[0..4] through verbatim into its Shape constructor). Any
+    silent conversion drift here would mean legacy users get a different
+    design than they recorded — would break the user's "long process for
+    creating these" trust.
+
+    This pins the contract: legacy → FD6 conversion is byte-faithful at
+    the per-shape level, not just at the aggregate count level."""
+    from forza_abyss_painter.shapegen.shapes.ellipse import RotatedEllipse
+    with open(_EREBUS_PATH) as f:
+        data = json.load(f)
+    drawables_raw = data["shapes"][1:]   # skip BG
+    doc = FD6Document.from_dict(data)
+    shapes = doc.materialize_shapes()
+    assert len(drawables_raw) == len(shapes) == 1000
+    mismatches = []
+    for i, (raw, ours) in enumerate(zip(drawables_raw, shapes)):
+        if raw["type"] != 16 or raw["color"][3] <= 0:
+            continue   # painter would skip these too
+        if not isinstance(ours, RotatedEllipse):
+            mismatches.append((i, f"wrong type: {type(ours).__name__}"))
+            continue
+        rd = raw["data"]
+        if not (ours.x == rd[0] and ours.y == rd[1]
+                and ours.rx == rd[2] and ours.ry == rd[3]
+                and ours.angle == rd[4]
+                and ours.color == tuple(raw["color"])):
+            mismatches.append((i, f"raw={rd} {raw['color']} → ours x={ours.x} "
+                                  f"y={ours.y} rx={ours.rx} ry={ours.ry} "
+                                  f"angle={ours.angle} color={ours.color}"))
+    assert not mismatches, (
+        f"{len(mismatches)} of 1000 shapes drifted from painter's "
+        f"interpretation. First 3:\n" +
+        "\n".join(f"  shape {i}: {msg}" for i, msg in mismatches[:3])
+    )
