@@ -11,6 +11,62 @@ from forza_abyss_painter.io.exporter import save_json
 from forza_abyss_painter.io.json_schema import FD6Document
 
 
+#: Default upload-cap long side (pixels). Mirrors the colab pipeline's
+#: v0.1.5 UPLOAD_MAX_LONG_SIDE default. 720 is the sweet spot for CPU
+#: shape-gen on the EXE's typical user hardware: large enough to keep
+#: portrait detail intact, small enough to keep one-shape-iteration well
+#: under a second so the GUI stays responsive.
+DEFAULT_UPLOAD_CAP_PX = 720
+
+
+def _apply_upload_cap(
+    img: Image.Image,
+    alpha_mask: np.ndarray | None,
+    *,
+    profile_max_resolution: int,
+    upload_cap_px: int,
+    buffer_frac: float = 0.08,
+) -> tuple[Image.Image, np.ndarray | None, bool]:
+    """Downscale img so the FINAL PADDED canvas stays under the upload cap.
+
+    Ports v0.1.5 from the colab pipeline (sister repo's
+    `notebooks/build_colab_notebook.py` -> `_load_image_bytes`). The trick
+    is to reserve padding budget up front: the cap applies to the final
+    padded output, so we divide by (1 + 2*buffer_frac) to derive the
+    effective INPUT max — that way after `_pad_with_source_mean` fires,
+    the post-pad long side lands at or below `effective_max`.
+
+    `upload_cap_px <= 0` disables the cap entirely. Callers wanting the
+    pre-v0.1.5 behavior (no upload-time safety net, only the
+    profile.max_resolution downscale that runs post-padding) pass 0.
+
+    The cap is `min(profile.max_resolution, upload_cap_px)` — there's no
+    point shrinking below the preset's own ceiling, that would just lose
+    detail without speeding anything up.
+
+    Returns (img, alpha_mask, was_resized) so callers can log when the
+    cap actually fired (useful for the UI: "auto-resized your 4K input
+    to 720px for safety").
+    """
+    if upload_cap_px <= 0:
+        return img, alpha_mask, False
+    effective_max = min(profile_max_resolution, upload_cap_px)
+    pad_factor = 1.0 + 2.0 * buffer_frac
+    effective_input_max = max(1, int(effective_max / pad_factor))
+    if max(img.size) <= effective_input_max:
+        return img, alpha_mask, False
+    scale = effective_input_max / max(img.size)
+    new_size = (
+        max(1, int(img.size[0] * scale)),
+        max(1, int(img.size[1] * scale)),
+    )
+    img = img.resize(new_size, Image.LANCZOS)
+    if alpha_mask is not None:
+        am_img = Image.fromarray(alpha_mask, "L").resize(new_size, Image.LANCZOS)
+        alpha_mask = np.asarray(am_img, dtype=np.uint8)
+    return img, alpha_mask, True
+
+
 def _pad_with_source_mean(
     img: Image.Image,
     *,
@@ -79,12 +135,23 @@ class GenerationWorker(QObject):
     error = Signal(str)
     checkpoint_written = Signal(str)    # checkpoint json path
 
-    def __init__(self, image_path: Path, profile: Profile, output_dir: Path | None = None, sticker_mode: bool = False) -> None:
+    def __init__(
+        self,
+        image_path: Path,
+        profile: Profile,
+        output_dir: Path | None = None,
+        sticker_mode: bool = False,
+        upload_cap_px: int = DEFAULT_UPLOAD_CAP_PX,
+    ) -> None:
         super().__init__()
         self.image_path = Path(image_path)
         self.profile = profile
         self.output_dir = Path(output_dir) if output_dir else self.image_path.parent / self.image_path.stem
         self.sticker_mode = sticker_mode  # When True, keep source alpha and skip transparent areas
+        # Safety cap on the final padded canvas long side. <=0 disables.
+        # Default mirrors the colab pipeline's v0.1.5 UPLOAD_MAX_LONG_SIDE
+        # — see _apply_upload_cap for the math.
+        self.upload_cap_px = int(upload_cap_px)
         self._engine: Engine | None = None
         self._paused = False
 
@@ -118,6 +185,19 @@ class GenerationWorker(QObject):
                     img = bg
             else:
                 img = img.convert("RGB")
+            # Upload-cap auto-resize: shrink obviously-oversized inputs
+            # (e.g., raw 4K phone uploads) BEFORE padding so we don't burn
+            # memory + CPU on a phantom oversized canvas the engine would
+            # immediately downscale anyway. The cap reserves the 8% per
+            # side padding budget up front so the post-pad long side
+            # lands at or below upload_cap_px. See _apply_upload_cap.
+            img, alpha_mask, _capped = _apply_upload_cap(
+                img,
+                alpha_mask,
+                profile_max_resolution=self.profile.max_resolution,
+                upload_cap_px=self.upload_cap_px,
+                buffer_frac=0.08,
+            )
             # Source-mean padding: both the non-square square-up step AND the
             # 8%-per-side edge buffer fill with the source image's mean RGB
             # instead of hardcoded white. Stops the shape-generator from
