@@ -201,6 +201,18 @@ class MainWindow(QMainWindow):
         generate_act.triggered.connect(self._on_generate_locally)
         tools_menu.addAction(generate_act)
 
+        # One-click fap-clean: load a JSON, strip padding-whites + dead
+        # weight, save the cleaned file. Same library function the CLI
+        # uses; this is purely a UX surface for users who don't want to
+        # drop to a terminal.
+        clean_act = QAction("&Clean current JSON…", self)
+        clean_act.setStatusTip(
+            "Strip padding-white + fully-occluded shapes from a JSON "
+            "(same cleanup as the fap-clean CLI)"
+        )
+        clean_act.triggered.connect(self._on_clean_json)
+        tools_menu.addAction(clean_act)
+
         view_menu = mbar.addMenu("&View")
         theme_menu = view_menu.addMenu("&Theme")
         from PySide6.QtGui import QActionGroup
@@ -604,6 +616,20 @@ class MainWindow(QMainWindow):
             self._on_json_loaded_for_preview(out)
             self.statusBar().showMessage(
                 f"Generated {out.name} — ready to inject.", 8000,
+            )
+
+    def _on_clean_json(self) -> None:
+        """Tools menu → Clean current JSON. Lazy-import the dialog so
+        the cleanup deps don't load until first use. On a successful
+        save the cleaned JSON auto-loads into the preview panel via
+        the same path Upload JSON uses — so the user immediately sees
+        the cleaned result and can re-inject without an extra click."""
+        from forza_abyss_painter.gui.clean_dialog import open_clean_json_dialog
+        out = open_clean_json_dialog(self)
+        if out is not None and out.exists():
+            self._on_json_loaded_for_preview(out)
+            self.statusBar().showMessage(
+                f"Cleaned JSON saved to {out.name} — ready to inject.", 8000,
             )
 
     def _on_files_selected(self, paths: list[Path]) -> None:
