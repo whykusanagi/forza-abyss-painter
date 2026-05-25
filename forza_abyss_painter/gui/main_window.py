@@ -902,6 +902,39 @@ class MainWindow(QMainWindow):
             )
             self.queue.set_status(image_path, "queued")
             return
+
+        # VRAM budget pre-flight. Compute the predicted peak from the
+        # user's current settings (port of the colab planner formula)
+        # and compare against their chosen budget. If peak > budget *
+        # 0.85 (15% headroom for driver + OS overhead), warn the user
+        # and let them decide whether to proceed. This is the
+        # difference between "GPU starved FH6 mid-game" (current pain
+        # point) and "the app told me before I started".
+        peak_gib = self.settings_panel.estimate_peak_vram_gib(profile)
+        budget_gib = self.settings_panel.selected_vram_budget_gib()
+        if budget_gib > 0 and peak_gib > budget_gib * 0.85:
+            answer = QMessageBox.question(
+                self, "GPU run may exceed VRAM budget",
+                f"This run is estimated to need <b>{peak_gib:.1f} GiB</b> "
+                f"of VRAM, but your budget is <b>{budget_gib} GiB</b> "
+                f"(85% safe threshold: {budget_gib * 0.85:.1f} GiB).\n\n"
+                f"Likely outcomes if you proceed:\n"
+                f"  • Other GPU apps (FH6, Discord, browser) slow down "
+                f"or stutter\n"
+                f"  • CUDA OOM mid-run with a generic 'out of memory' "
+                f"error\n"
+                f"  • Driver crash on extreme over-budget runs\n\n"
+                f"Fixes (settings panel):\n"
+                f"  • Lower <b>Random samples</b> (~half = ~half VRAM)\n"
+                f"  • Lower <b>Max resolution</b> (drop to 800 or 600 px)\n"
+                f"  • Raise <b>GPU VRAM budget</b> to a higher tier\n\n"
+                f"Proceed anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self.queue.set_status(image_path, "queued")
+                return
         # Build a preset dict matching gpu_gen_worker.build_run_config()'s
         # expected fields. Source values from the SettingsPanel so what
         # the user picked in CPU mode carries over to GPU.
@@ -939,6 +972,13 @@ class MainWindow(QMainWindow):
         self._worker.done.connect(self._on_gpu_done)
         self._worker.error.connect(self._on_gpu_error)
         self._worker.finished.connect(self._teardown_thread)
+        # Capture start time so the GPU progress slot can compute a
+        # live shapes/sec rate + ETA — same formula the colab pipeline
+        # prints (engine.py:522-527 in the sister repo). Without this,
+        # users staring at a frozen "shape N of T" indicator have no
+        # way to judge whether the run takes 1 minute or 30.
+        import time as _time
+        self._gpu_run_start_t = _time.monotonic()
         self._thread.start()
         self.settings_panel.set_running(True)
         self.statusBar().showMessage(
@@ -947,8 +987,27 @@ class MainWindow(QMainWindow):
         )
 
     def _on_gpu_progress(self, shape_count: int, total: int) -> None:
-        if total > 0:
-            pct = max(0, min(100, int(100 * shape_count / total)))
+        if total <= 0:
+            return
+        pct = max(0, min(100, int(100 * shape_count / total)))
+        # Live rate + ETA from start-of-run timestamp. Mirrors the
+        # colab engine's `print(f"{idx}/{total} ({rate}/s, ETA {eta}s, RMS …)")`
+        # so users see a moving clock + speed signal regardless of
+        # GPU model. Skip the ETA on the first event (rate not yet
+        # meaningful with elapsed near zero).
+        import time as _time
+        elapsed = _time.monotonic() - getattr(self, "_gpu_run_start_t",
+                                              _time.monotonic())
+        if elapsed > 1.0 and shape_count > 0:
+            rate = shape_count / elapsed
+            eta_s = int((total - shape_count) / rate) if rate > 0 else 0
+            mins, secs = divmod(eta_s, 60)
+            eta_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+            self.statusBar().showMessage(
+                f"GPU: shape {shape_count} of {total} ({pct}%) — "
+                f"{rate:.1f} shapes/s, ETA {eta_str}"
+            )
+        else:
             self.statusBar().showMessage(
                 f"GPU: shape {shape_count} of {total} ({pct}%)"
             )

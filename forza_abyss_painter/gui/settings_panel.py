@@ -64,6 +64,49 @@ class SettingsPanel(QWidget):
         # Populate the GPU label based on current install state.
         self._refresh_gpu_backend_label()
 
+        # VRAM budget selector — only meaningful when GPU is the chosen
+        # backend, but always visible so the user understands it exists
+        # before they switch. Tester reported the GPU run was eating
+        # all available VRAM and starving FH6 / Discord / other apps;
+        # this gives them a knob to cap usage. Ports the colab
+        # CELL_RESOLUTION_PLANNER (build_colab_notebook.py:287-372)
+        # peak-VRAM formula so the EXE warns BEFORE Start when current
+        # settings would blow the budget.
+        vram_row = QHBoxLayout()
+        vram_label = QLabel("GPU VRAM budget:")
+        vram_label.setToolTip(
+            "How much VRAM the GPU shape-gen is allowed to use. Pick "
+            "lower budgets when you're running FH6 / Discord / other "
+            "GPU apps in parallel so they don't get starved. The app "
+            "computes peak VRAM from your current settings + warns "
+            "before Start if you'd exceed the budget. Auto = use 80% "
+            "of free VRAM (recommended unless you want explicit "
+            "headroom for other apps)."
+        )
+        vram_row.addWidget(vram_label)
+        self.vram_budget_combo = QComboBox(self)
+        self.vram_budget_combo.setToolTip(vram_label.toolTip())
+        # Budget options (label, GiB value or 0 for auto). Spans
+        # gaming-card range (8 GiB minimum modern card) to RTX 5090
+        # (32 GiB). 'Auto' resolves to 80% of detected free VRAM at
+        # Start time.
+        for label, gib in (
+            ("Auto (80% of free VRAM)", 0),
+            ("4 GiB — light (FH6 + other apps active)", 4),
+            ("6 GiB — moderate", 6),
+            ("8 GiB — standard gaming card", 8),
+            ("12 GiB — RTX 3060/4070 class", 12),
+            ("16 GiB — RTX 4080 class", 16),
+            ("24 GiB — RTX 4090 class", 24),
+            ("32 GiB — RTX 5090 class", 32),
+        ):
+            self.vram_budget_combo.addItem(label, userData=gib)
+        # Default to Auto so users don't have to guess; explicit pick
+        # is for the "I have FH6 + Discord open" scenario.
+        self.vram_budget_combo.setCurrentIndex(0)
+        vram_row.addWidget(self.vram_budget_combo, stretch=1)
+        layout.addLayout(vram_row)
+
         # Profile picker
         prof_row = QHBoxLayout()
         prof_label = QLabel("Profile:")
@@ -121,12 +164,15 @@ class SettingsPanel(QWidget):
             "override this if you want to free up cores for something else "
             "while generation runs (e.g. set it to half your core count)."
         )
-        self.preview_every = QSpinBox(); self.preview_every.setRange(1, 100); self.preview_every.setValue(1)
+        self.preview_every = QSpinBox(); self.preview_every.setRange(1, 100); self.preview_every.setValue(50)
         self.preview_every.setToolTip(
             "How often to refresh the live preview pane during generation. "
-            "1 = redraw after every shape (smoothest, slight CPU cost). "
-            "10 = redraw every 10 shapes (faster, choppier). Doesn't affect "
-            "the final result, only what you see while it's running."
+            "50 = redraw every 50 shapes (default, matches the Colab "
+            "notebook cadence — good balance of feedback + speed). "
+            "Lower = smoother preview but slower generation. "
+            "1 = redraw after every shape (smoothest, slight cost). "
+            "Doesn't affect the final result, only what you see while "
+            "it's running."
         )
         # QFormLayout auto-creates QLabel widgets for the left column. Those
         # labels do NOT inherit tooltips from their paired field, so hovering
@@ -263,6 +309,42 @@ class SettingsPanel(QWidget):
 
         # Apply initial profile
         self._on_profile_changed(self.profile_combo.currentIndex())
+
+    def selected_vram_budget_gib(self) -> int:
+        """Return the user's chosen VRAM budget in GiB, or 0 for Auto.
+        Caller (main_window's _start_gpu) compares the estimated peak
+        against this + surfaces a warning if peak > budget * 0.85."""
+        data = self.vram_budget_combo.currentData()
+        return int(data) if data is not None else 0
+
+    def estimate_peak_vram_gib(self, profile) -> float:
+        """Port of the colab CELL_RESOLUTION_PLANNER peak-VRAM formula
+        (build_colab_notebook.py:287-372). Predicts peak VRAM from
+        the user's current shape-gen settings BEFORE the run starts
+        so we can warn them in time.
+
+        Formula: peak ≈ K × footprint × 3 channels × 4 bytes/float32
+                       × safety_multiplier / 1e9 (→ GiB).
+        Where:
+          K          = random_samples (single-shape ellipse-only)
+          footprint  = bbox crop² (single ellipse) or full canvas
+          safety_mul = 5.5 (bbox-local) or 3.5 (full canvas)
+
+        EXE shape-gen always runs ellipse-only single-type so we use
+        the bbox-local branch — same as colab's
+        bbox_local + rotated_ellipse path.
+        """
+        max_res = max(64, int(profile.max_resolution))
+        samples = max(1, int(profile.random_samples))
+        # bbox crop: min(256, max_dim/8) — mirrors engine.py:160 crop
+        crop_e = min(256, max_res // 8)
+        footprint = min((2 * crop_e + 1) ** 2, max_res * max_res)
+        bytes_per_pixel_3ch_f32 = 3 * 4   # 12 bytes
+        safety_multiplier = 5.5            # bbox-local calibrated value
+        peak_gib = (
+            samples * footprint * bytes_per_pixel_3ch_f32 * safety_multiplier
+        ) / 1e9
+        return peak_gib
 
     def selected_backend(self) -> str:
         """Return 'cpu' or 'gpu' — which shape-gen backend the user

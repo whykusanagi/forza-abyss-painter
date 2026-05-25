@@ -27,9 +27,27 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
+
+
+# Windows-only: CREATE_NO_WINDOW (0x08000000) keeps the embedded
+# python.exe subprocess from popping up a visible cmd window. Without
+# this flag, the GPU shape-gen run shows a black/grey terminal that
+# testers close thinking it's stuck — same failure mode the install
+# step had (NTSTATUS 0xC000013A on user-cancel). Identical fix here.
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def _subprocess_creationflags() -> int:
+    """Windows-only flag suite for subprocess.Popen. Returns 0 on
+    non-Windows since creationflags has no useful values elsewhere."""
+    if sys.platform == "win32":
+        return _CREATE_NO_WINDOW
+    return 0
 
 
 class GpuGenWorker(QObject):
@@ -111,6 +129,11 @@ class GpuGenWorker(QObject):
                 stdout=subprocess.PIPE,
                 text=True,
                 bufsize=1,
+                # CREATE_NO_WINDOW on Windows — same fix as the install
+                # phase. Without this, testers see a leaked cmd window
+                # during GPU generation and close it, killing the
+                # subprocess + the run.
+                creationflags=_subprocess_creationflags(),
             )
         except OSError as exc:
             logger.log_exception("gen_worker_subprocess_spawn_failed", exc)
