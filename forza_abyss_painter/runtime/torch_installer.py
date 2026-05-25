@@ -305,6 +305,7 @@ def install_runtime(
     _subprocess_run=None,
     _source_pkg_dir=None,
     _extract_zip=None,
+    _logger=None,
 ) -> RuntimeInfo:
     """Download embedded Python + torch (cu121) into the runtime dir,
     bootstrap pip, install dependencies, copy the forza_abyss_painter
@@ -341,14 +342,32 @@ def install_runtime(
     src_pkg = _source_pkg_dir() if callable(_source_pkg_dir) else (
         _source_pkg_dir or _source_package_dir()
     )
+    # Diagnostic logger: lazy-import so importing torch_installer doesn't
+    # also import gpu_logger (which would create a log file the first
+    # time `is_runtime_installed()` is checked at GUI startup — wasteful
+    # if the user never triggers the install path).
+    if _logger is None:
+        from forza_abyss_painter.runtime.gpu_logger import get_gpu_logger
+        _logger = get_gpu_logger()
 
     def _report(pct: int, status: str) -> None:
+        _logger.log("install_progress", percent=pct, status=status)
         if progress_cb is not None:
             progress_cb(pct, status)
+
+    _logger.log("install_runtime_called",
+                runtime_root=str(runtime_root()),
+                embed_python_version=EMBED_PYTHON_VERSION,
+                torch_version=TORCH_VERSION,
+                torch_cuda_index=TORCH_CUDA_INDEX)
 
     # Phase 0: skip if already installed.
     existing = installed_runtime_info()
     if existing is not None and existing.cuda_available:
+        _logger.log("install_skip_already_installed",
+                    torch_version=existing.torch_version,
+                    cuda_device_name=existing.cuda_device_name,
+                    installed_at_utc=existing.installed_at_utc)
         _report(100, f"Runtime already installed (torch {existing.torch_version})")
         return existing
 
@@ -361,7 +380,12 @@ def install_runtime(
     embed_zip = root / f"python-{EMBED_PYTHON_VERSION}-embed-amd64.zip"
     _report(2, f"Downloading embedded Python {EMBED_PYTHON_VERSION}")
     try:
-        urlretrieve(EMBED_PYTHON_URL, embed_zip)
+        with _logger.start_phase("download_python",
+                                  url=EMBED_PYTHON_URL,
+                                  dest=str(embed_zip)):
+            urlretrieve(EMBED_PYTHON_URL, embed_zip)
+            _logger.log("download_python_size",
+                        size_bytes=embed_zip.stat().st_size if embed_zip.exists() else 0)
     except Exception as exc:
         raise InstallError(
             stage="download_python",
@@ -372,11 +396,12 @@ def install_runtime(
     _report(10, "Extracting embedded Python")
     embed_dir.mkdir(parents=True, exist_ok=True)
     try:
-        if _extract_zip is not None:
-            _extract_zip(embed_zip, embed_dir)
-        else:
-            with zipfile.ZipFile(embed_zip) as zf:
-                zf.extractall(embed_dir)
+        with _logger.start_phase("extract_python", embed_dir=str(embed_dir)):
+            if _extract_zip is not None:
+                _extract_zip(embed_zip, embed_dir)
+            else:
+                with zipfile.ZipFile(embed_zip) as zf:
+                    zf.extractall(embed_dir)
     except (zipfile.BadZipFile, OSError) as exc:
         raise InstallError(
             stage="extract_python",
@@ -416,7 +441,8 @@ def install_runtime(
     # Phase 5: bootstrap pip into the embedded Python.
     _report(25, "Bootstrapping pip")
     try:
-        sp_run([str(embed_exe), str(get_pip)], capture=True)
+        with _logger.start_phase("bootstrap_pip", get_pip=str(get_pip)):
+            sp_run([str(embed_exe), str(get_pip)], capture=True)
     except Exception as exc:
         raise InstallError(
             stage="bootstrap_pip",
@@ -431,13 +457,16 @@ def install_runtime(
     # pip returns.
     _report(30, f"Installing torch {TORCH_VERSION} + deps (~3 GiB, takes 5-15 min)")
     try:
-        sp_run(
-            [str(embed_exe), "-m", "pip", "install",
-             "--index-url", TORCH_CUDA_INDEX,
-             "--extra-index-url", "https://pypi.org/simple",
-             *PIP_INSTALL_SPEC],
-            capture=True,
-        )
+        with _logger.start_phase("pip_install",
+                                  index_url=TORCH_CUDA_INDEX,
+                                  spec=PIP_INSTALL_SPEC):
+            sp_run(
+                [str(embed_exe), "-m", "pip", "install",
+                 "--index-url", TORCH_CUDA_INDEX,
+                 "--extra-index-url", "https://pypi.org/simple",
+                 *PIP_INSTALL_SPEC],
+                capture=True,
+            )
     except Exception as exc:
         raise InstallError(
             stage="pip_install",
@@ -470,19 +499,23 @@ def install_runtime(
     cuda_available = False
     cuda_device_name = ""
     try:
-        proc = sp_run(
-            [str(embed_exe), "-c",
-             "import json, torch; "
-             "info = {'cuda_available': torch.cuda.is_available(), "
-             "'device_name': torch.cuda.get_device_name(0) "
-             "if torch.cuda.is_available() else ''}; "
-             "print(json.dumps(info))"],
-            capture=True,
-        )
-        out = proc.stdout.strip().splitlines()[-1]
-        verdict = json.loads(out)
-        cuda_available = bool(verdict.get("cuda_available", False))
-        cuda_device_name = str(verdict.get("device_name", ""))
+        with _logger.start_phase("verify_cuda"):
+            proc = sp_run(
+                [str(embed_exe), "-c",
+                 "import json, torch; "
+                 "info = {'cuda_available': torch.cuda.is_available(), "
+                 "'device_name': torch.cuda.get_device_name(0) "
+                 "if torch.cuda.is_available() else ''}; "
+                 "print(json.dumps(info))"],
+                capture=True,
+            )
+            out = proc.stdout.strip().splitlines()[-1]
+            verdict = json.loads(out)
+            cuda_available = bool(verdict.get("cuda_available", False))
+            cuda_device_name = str(verdict.get("device_name", ""))
+            _logger.log("cuda_verdict",
+                        cuda_available=cuda_available,
+                        cuda_device_name=cuda_device_name)
     except Exception as exc:
         raise InstallError(
             stage="verify_cuda",
@@ -501,5 +534,7 @@ def install_runtime(
     runtime_marker().write_text(
         json.dumps(info.to_dict(), indent=2), encoding="utf-8",
     )
+    _logger.log("install_runtime_done", outcome="ok",
+                runtime_info=info.to_dict())
     _report(100, "Done")
     return info

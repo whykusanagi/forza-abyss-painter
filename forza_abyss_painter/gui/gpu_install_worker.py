@@ -75,21 +75,29 @@ class GpuInstallWorker(QObject):
         with a try/except matrix that maps each failure mode to a typed
         signal so the dialog can route to the right UX state."""
         from forza_abyss_painter.runtime.torch_installer import InstallError
+        from forza_abyss_painter.runtime.gpu_logger import get_gpu_logger
+        logger = get_gpu_logger()
+        logger.log("install_worker_run_started")
 
         try:
             info = self._install_fn(progress_cb=self._on_install_progress)
+            logger.log("install_worker_done", runtime_info=info.to_dict())
             self.done.emit(info.to_dict())
         except InstallError as exc:
             # Typed installer error — stage carries enough context for
             # the dialog to surface a specific help message (download
             # failure vs pip failure vs CUDA verify failure).
+            logger.log("install_worker_install_error",
+                       stage=exc.stage, message=exc.message)
             self.error.emit(exc.stage, exc.message)
         except Exception as exc:   # pragma: no cover — defensive
             # Anything else is a bug in the installer. Surface with
             # stage='unknown' so the dialog still shows SOMETHING; the
             # message captures the exception class for debugging.
+            logger.log_exception("install_worker_unknown_error", exc)
             self.error.emit("unknown", f"{type(exc).__name__}: {exc}")
         finally:
+            logger.log("install_worker_finished")
             self.finished.emit()
 
     def _on_install_progress(self, percent: int, status: str) -> None:

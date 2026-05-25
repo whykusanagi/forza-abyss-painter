@@ -221,6 +221,20 @@ class MainWindow(QMainWindow):
         clean_act.triggered.connect(self._on_clean_json)
         tools_menu.addAction(clean_act)
 
+        # Save diagnostics bundle: zip the GPU logs + runtime marker +
+        # system info so testers can email a single attachment when
+        # something goes wrong. Lives under Tools regardless of the
+        # GPU flag because diagnostics are useful for non-GPU issues
+        # too (the bundle includes inject logs from the existing
+        # injector flow via the same logs directory).
+        diag_act = QAction("Save &diagnostics zip…", self)
+        diag_act.setStatusTip(
+            "Bundle recent logs + runtime state + system info into a "
+            "zip you can email for support"
+        )
+        diag_act.triggered.connect(self._on_save_diagnostics)
+        tools_menu.addAction(diag_act)
+
         view_menu = mbar.addMenu("&View")
         theme_menu = view_menu.addMenu("&Theme")
         from PySide6.QtGui import QActionGroup
@@ -625,6 +639,42 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Generated {out.name} — ready to inject.", 8000,
             )
+
+    def _on_save_diagnostics(self) -> None:
+        """Tools menu → Save diagnostics zip. Opens a file picker for
+        the output path, calls the diagnostics-bundle library, then
+        shows the result in the status bar so the user knows where the
+        file landed. On error, surfaces a modal with the OS error
+        message so the user knows what to retry."""
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        from datetime import datetime, timezone
+        from forza_abyss_painter.runtime.diagnostics import build_bundle
+
+        default = (
+            Path.home() /
+            f"ForzaAbyssPainter-diag-"
+            f"{datetime.now(timezone.utc).strftime('%Y-%m-%d-%H%M%S')}.zip"
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save diagnostics zip",
+            str(default), "Zip archive (*.zip)",
+        )
+        if not path:
+            return
+        try:
+            result = build_bundle(Path(path))
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Couldn't save diagnostics",
+                f"Failed to write bundle:\n\n"
+                f"{type(exc).__name__}: {exc}",
+            )
+            return
+        size_mb = result.stat().st_size / (1 << 20)
+        self.statusBar().showMessage(
+            f"Diagnostics saved to {result.name} ({size_mb:.1f} MiB)",
+            10000,
+        )
 
     def _on_clean_json(self) -> None:
         """Tools menu → Clean current JSON. Lazy-import the dialog so

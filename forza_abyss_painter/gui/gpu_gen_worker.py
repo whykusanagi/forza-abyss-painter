@@ -77,10 +77,18 @@ class GpuGenWorker(QObject):
         """Worker entry point. Connected to QThread.started so it runs
         on the worker thread, not the GUI thread. Drives the subprocess
         to completion (or cancellation) and emits finished() last."""
+        from forza_abyss_painter.runtime.gpu_logger import get_gpu_logger
+        logger = get_gpu_logger()
+        logger.log("gen_worker_run_started",
+                   embedded_python=str(self._py),
+                   config_path=str(self._config_path))
+
         # Pre-flight: python.exe must exist or the user is calling Generate
         # before the runtime install completed. The error here is
         # actionable — the dialog should pop the install prompt.
         if not self._py.exists():
+            logger.log("gen_worker_missing_python_exe",
+                       expected_path=str(self._py))
             self.error.emit(
                 "missing_runtime",
                 f"Embedded Python not found at {self._py}. "
@@ -93,16 +101,19 @@ class GpuGenWorker(QObject):
         # (just for diagnostics; not parsed). Line buffering = events
         # arrive as fast as the subprocess flushes them.
         try:
+            cmd = [str(self._py), "-m",
+                   "forza_abyss_painter.runtime.torch_runner",
+                   "--config", str(self._config_path)]
+            logger.log("gen_worker_subprocess_spawn", cmd=cmd)
             self._proc = self._popen_factory(
-                [str(self._py), "-m",
-                 "forza_abyss_painter.runtime.torch_runner",
-                 "--config", str(self._config_path)],
+                cmd,
                 stderr=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 text=True,
                 bufsize=1,
             )
         except OSError as exc:
+            logger.log_exception("gen_worker_subprocess_spawn_failed", exc)
             self.error.emit("spawn", f"failed to spawn subprocess: {exc}")
             self.finished.emit()
             return
@@ -180,6 +191,11 @@ class GpuGenWorker(QObject):
                 "Subprocess exited 0 but never emitted a 'done' event.",
             )
 
+        logger.log("gen_worker_finished",
+                   returncode=rc,
+                   cancelled=self._cancelled,
+                   emitted_done=emitted_done,
+                   emitted_error=emitted_error)
         self.finished.emit()
 
     def _dispatch(self, event: dict) -> bool:

@@ -234,6 +234,26 @@ def _downscale_to_max_resolution(rgb, alpha, max_resolution: int):
 
 def run(cfg: RunConfig, stream=sys.stderr) -> int:
     """Execute the configured run. Returns exit code."""
+    # Subprocess gets its own log session file (process_label='runner')
+    # so the diagnostics bundle ships both halves of the run (main +
+    # runner) side-by-side. Failures here often DON'T reach the main
+    # process's stderr parser (e.g., torch import crash with no traceback),
+    # so this on-disk log is the only diagnostic path.
+    try:
+        from forza_abyss_painter.runtime.gpu_logger import get_gpu_logger
+        logger = get_gpu_logger(process_label="runner")
+        logger.log("runner_started", cfg_summary=cfg.summary())
+    except Exception:   # pragma: no cover — defensive
+        # If even gpu_logger fails to import (gpu_logger isn't in the
+        # embedded site-packages copy), don't crash the runner. Fall
+        # back to a no-op stub so the rest of run() still works.
+        class _NoopLogger:
+            def log(self, *a, **kw): pass
+            def log_exception(self, *a, **kw): pass
+            def start_phase(self, *a, **kw):
+                from contextlib import nullcontext
+                return nullcontext()
+        logger = _NoopLogger()
     emit(stream, {"kind": "started", "cfg_summary": cfg.summary()})
 
     # Lazy-import the engine so a bad config (caught in main()) doesn't
@@ -241,7 +261,8 @@ def run(cfg: RunConfig, stream=sys.stderr) -> int:
     # 'import_engine' error event if the user clicked Generate before
     # the runtime installer completed.
     try:
-        from forza_abyss_painter.shapegen.gpu.engine import GPUConfig, run_gpu
+        with logger.start_phase("import_engine"):
+            from forza_abyss_painter.shapegen.gpu.engine import GPUConfig, run_gpu
     except ImportError as exc:
         emit(stream, {
             "kind": "error", "stage": "import_engine",
@@ -255,10 +276,17 @@ def run(cfg: RunConfig, stream=sys.stderr) -> int:
 
     # Load + downscale image.
     try:
-        rgb, alpha_mask = _load_image(cfg.image_path)
-        rgb, alpha_mask = _downscale_to_max_resolution(
-            rgb, alpha_mask, cfg.max_resolution,
-        )
+        with logger.start_phase("load_image", image_path=str(cfg.image_path)):
+            rgb, alpha_mask = _load_image(cfg.image_path)
+            logger.log("image_loaded",
+                       shape=list(rgb.shape),
+                       has_alpha=alpha_mask is not None)
+            rgb, alpha_mask = _downscale_to_max_resolution(
+                rgb, alpha_mask, cfg.max_resolution,
+            )
+            logger.log("image_downscaled",
+                       final_shape=list(rgb.shape),
+                       max_resolution=cfg.max_resolution)
     except (OSError, ValueError) as exc:
         emit(stream, {
             "kind": "error", "stage": "load_image",
@@ -294,14 +322,18 @@ def run(cfg: RunConfig, stream=sys.stderr) -> int:
         # progress_every and checkpoint_every BOTH drive emit() — at
         # different cadences. progress_every is cheap (just a number);
         # checkpoint_every includes the full shape list (heavier).
-        shapes_list, _final_canvas = run_gpu(
-            target_rgb=rgb,
-            cfg=gpu_cfg,
-            alpha_mask=alpha_mask if cfg.sticker_mode else None,
-            progress_every=cfg.progress_every,
-            checkpoint_cb=_checkpoint_cb if cfg.checkpoint_every > 0 else None,
-            checkpoint_every=cfg.checkpoint_every,
-        )
+        with logger.start_phase("run_gpu",
+                                 num_shapes=cfg.num_shapes,
+                                 random_samples=cfg.random_samples):
+            shapes_list, _final_canvas = run_gpu(
+                target_rgb=rgb,
+                cfg=gpu_cfg,
+                alpha_mask=alpha_mask if cfg.sticker_mode else None,
+                progress_every=cfg.progress_every,
+                checkpoint_cb=_checkpoint_cb if cfg.checkpoint_every > 0 else None,
+                checkpoint_every=cfg.checkpoint_every,
+            )
+            logger.log("run_gpu_done", shapes_count=len(shapes_list))
     except RuntimeError as exc:
         # run_gpu's OOM wrapper converts torch.cuda.OutOfMemoryError into
         # a RuntimeError with an actionable recipe — pass that through
@@ -323,17 +355,19 @@ def run(cfg: RunConfig, stream=sys.stderr) -> int:
     # exact same schema the CPU worker emits — load_json on the EXE side
     # will round-trip cleanly. See §3 of CLAUDE.md.
     try:
-        from forza_abyss_painter.io.exporter import save_json
-        from forza_abyss_painter.io.json_schema import FD6Document
-        h, w = rgb.shape[:2]
-        doc = FD6Document.from_engine(
-            source_image=cfg.image_path.name,
-            image_size=(w, h),   # JSON convention is (width, height)
-            shapes=_shape_dicts_to_objects(shapes_list),
-            profile_name=cfg.preset_label,
-            sticker_mode=cfg.sticker_mode,
-        )
-        save_json(doc, cfg.output_json_path)
+        with logger.start_phase("save_json",
+                                 output_path=str(cfg.output_json_path)):
+            from forza_abyss_painter.io.exporter import save_json
+            from forza_abyss_painter.io.json_schema import FD6Document
+            h, w = rgb.shape[:2]
+            doc = FD6Document.from_engine(
+                source_image=cfg.image_path.name,
+                image_size=(w, h),   # JSON convention is (width, height)
+                shapes=_shape_dicts_to_objects(shapes_list),
+                profile_name=cfg.preset_label,
+                sticker_mode=cfg.sticker_mode,
+            )
+            save_json(doc, cfg.output_json_path)
     except (OSError, ValueError, KeyError) as exc:
         emit(stream, {
             "kind": "error", "stage": "save_json",
@@ -341,6 +375,9 @@ def run(cfg: RunConfig, stream=sys.stderr) -> int:
         })
         return 1
 
+    logger.log("runner_done",
+               output_path=str(cfg.output_json_path),
+               shape_count=len(shapes_list))
     emit(stream, {
         "kind": "done",
         "output_path": str(cfg.output_json_path),
