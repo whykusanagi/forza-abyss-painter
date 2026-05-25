@@ -206,18 +206,89 @@ def _default_urlretrieve(url: str, dest: Path) -> None:
     urllib.request.urlretrieve(url, str(dest))
 
 
+# Windows constant — same value as subprocess.CREATE_NO_WINDOW (0x08000000)
+# but defined here so the function references work cross-platform (the
+# subprocess module exports CREATE_NO_WINDOW only on win32, and we want
+# `_subprocess_flags` importable everywhere for testability).
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def _subprocess_flags() -> int:
+    """Return Windows-specific subprocess creationflags so child
+    processes (embedded python.exe running pip) DO NOT pop up a visible
+    cmd window. Without this, a tester who saw the leaked console would
+    close it thinking it was a stuck child — terminating the install
+    mid-pip with NTSTATUS 0xC000013A (STATUS_CONTROL_C_EXIT).
+
+    On non-Windows platforms this returns 0 (no flags), since macOS/
+    Linux subprocess.run never spawns a console window for a GUI parent.
+    """
+    if sys.platform == "win32":
+        return _CREATE_NO_WINDOW
+    return 0
+
+
+# Windows return codes that indicate the subprocess was terminated by
+# the user closing its console window (NTSTATUS 0xC000013A —
+# STATUS_CONTROL_C_EXIT). Some Python builds report this as the
+# unsigned value 3221225786; others as the signed -1073741510. Map
+# BOTH to a 'cancelled' stage so the dialog can show 'install was
+# interrupted' rather than the generic 'pip failed' wall.
+_CANCEL_RETURN_CODES = (3221225786, -1073741510)
+
+
 def _default_subprocess_run(
     cmd: list[str], *, capture: bool = False,
 ) -> "subprocess.CompletedProcess":
     """Production subprocess.run: runs cmd with stdout/stderr captured
-    or attached as appropriate. Tests pass an injected fake."""
+    or attached as appropriate. Tests pass an injected fake.
+
+    On Windows, passes CREATE_NO_WINDOW via creationflags so child
+    processes don't allocate a visible console window. See
+    _subprocess_flags() docstring for why this matters.
+    """
     import subprocess
     return subprocess.run(
         cmd,
         check=True,
         capture_output=capture,
         text=True,
+        creationflags=_subprocess_flags() if sys.platform == "win32" else 0,
     )
+
+
+def _cleanup_partial_torch(site_packages_dir: Path) -> int:
+    """Wipe torch* and nvidia_* entries from the embedded
+    site-packages directory. Called from the pip_install except branch
+    when the user-cancel case isn't matched — without this, a retry
+    hits pip's 'already satisfied' for a torch install that's
+    structurally broken (no `installed.json`, package never copied)
+    and the resume looks like a no-op success.
+
+    Returns the count of top-level entries deleted. Best-effort: a
+    single failing rmtree doesn't stop the rest.
+    """
+    import shutil
+    if not site_packages_dir.is_dir():
+        return 0
+    deleted = 0
+    patterns = ("torch", "torch-*", "torchgen*",
+                "nvidia*", "fbgemm*", "sympy*")
+    seen: set[Path] = set()
+    for pattern in patterns:
+        for entry in site_packages_dir.glob(pattern):
+            if entry in seen:
+                continue
+            seen.add(entry)
+            try:
+                if entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+                deleted += 1
+            except OSError:
+                pass   # best-effort; partial cleanup is still progress
+    return deleted
 
 
 def _source_package_dir() -> Path:
@@ -455,7 +526,8 @@ def install_runtime(
     # callback — would need a `pip install --progress-bar json` parser
     # which doesn't exist. Just hold at the start-of-step value until
     # pip returns.
-    _report(30, f"Installing torch {TORCH_VERSION} + deps (~3 GiB, takes 5-15 min)")
+    _report(30, f"Installing torch {TORCH_VERSION} + deps "
+                f"(~3 GiB; takes 5-15 min — DO NOT close any windows)")
     try:
         with _logger.start_phase("pip_install",
                                   index_url=TORCH_CUDA_INDEX,
@@ -468,6 +540,32 @@ def install_runtime(
                 capture=True,
             )
     except Exception as exc:
+        # Distinguish user-cancellation from real pip failures: the
+        # tester closing a leaked Windows console produces NTSTATUS
+        # 0xC000013A which surfaces as returncode 3221225786 (or the
+        # signed equivalent -1073741510). Per Cursor's QUASAR
+        # post-mortem, this is the #1 cause of perceived "install
+        # failed" — we shouldn't show the same generic 'pip failed'
+        # modal for a user-initiated cancel as for a real pip error.
+        rc = getattr(exc, "returncode", None)
+        if sys.platform == "win32" and rc in _CANCEL_RETURN_CODES:
+            _logger.log("install_cancelled_by_user",
+                        returncode=rc, ntstatus="0xC000013A")
+            raise InstallError(
+                stage="cancelled",
+                message=(
+                    "Install was interrupted (a window was closed or "
+                    "the process was killed mid-download). Re-run "
+                    "Install GPU runtime and let it complete — first "
+                    "install takes 5-15 minutes."
+                ),
+            ) from exc
+        # Real failure — try to clean up the partial torch install so
+        # the retry doesn't hit 'already satisfied' for a broken state.
+        site_pkgs = embed_dir / "Lib" / "site-packages"
+        deleted = _cleanup_partial_torch(site_pkgs)
+        _logger.log("partial_install_cleanup",
+                    deleted_entries=deleted, site_pkgs=str(site_pkgs))
         raise InstallError(
             stage="pip_install",
             message=f"pip install failed: {exc}",

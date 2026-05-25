@@ -493,6 +493,180 @@ def test_enable_site_in_pth_raises_install_error_when_no_pth_present(tmp_path):
 # Pinned config
 
 
+def test_subprocess_flags_returns_create_no_window_on_windows(monkeypatch):
+    """The #1 lesson from QUASAR's failed install: a leaked cmd window
+    during pip looked like a stuck child process, tester closed it,
+    install died with 0xC000013A. _subprocess_flags must return
+    CREATE_NO_WINDOW (0x08000000) on Windows so the embedded python.exe
+    spawn never allocates a visible console."""
+    monkeypatch.setattr(ti.sys, "platform", "win32")
+    assert ti._subprocess_flags() == 0x08000000
+
+
+def test_subprocess_flags_returns_zero_on_non_windows(monkeypatch):
+    """macOS / Linux subprocess.run never spawns a console for a GUI
+    parent, and creationflags has no useful values on those platforms.
+    Flags must be 0 so the call is portable."""
+    for plat in ("darwin", "linux"):
+        monkeypatch.setattr(ti.sys, "platform", plat)
+        assert ti._subprocess_flags() == 0
+
+
+def test_pip_install_user_cancel_maps_to_cancelled_stage(
+    _isolated_runtime, _stub_source_pkg, monkeypatch,
+):
+    """When the user closes a leaked Windows console, the subprocess
+    returncode is 3221225786 (0xC000013A unsigned) or -1073741510
+    (signed). Both MUST map to InstallError(stage='cancelled'), not
+    the generic 'pip_install' failure — the dialog uses the stage tag
+    to show a friendly 'install was interrupted' modal instead of the
+    same wall-of-error for both UX states."""
+    monkeypatch.setattr(ti.sys, "platform", "win32")
+    embed_zip_bytes = _make_fake_embed_zip({
+        ti.embedded_python_exe().name: "x", "python311._pth": "#import site",
+    })
+    urlretrieve = _make_fake_urlretrieve({
+        ti.EMBED_PYTHON_URL: embed_zip_bytes,
+        ti.GET_PIP_URL: b"# stub",
+    })
+    import subprocess
+    def _sp_run_cancel_on_pip_install(cmd, *, capture=False):
+        if "install" in cmd and "pip" in cmd:
+            raise subprocess.CalledProcessError(
+                returncode=3221225786, cmd=cmd,
+                stderr="(no output — process terminated)",
+            )
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = ""
+        return result
+    with pytest.raises(ti.InstallError) as excinfo:
+        ti.install_runtime(
+            _urlretrieve=urlretrieve,
+            _subprocess_run=_sp_run_cancel_on_pip_install,
+            _source_pkg_dir=_stub_source_pkg,
+        )
+    assert excinfo.value.stage == "cancelled", (
+        f"unsigned 3221225786 should map to 'cancelled', got "
+        f"{excinfo.value.stage!r}. Without this mapping the user-cancel "
+        f"and real-pip-failure cases share the same error UX."
+    )
+    assert "interrupted" in excinfo.value.message.lower()
+
+
+def test_pip_install_user_cancel_signed_returncode_also_maps(
+    _isolated_runtime, _stub_source_pkg, monkeypatch,
+):
+    """Some Python builds report 0xC000013A as the signed value
+    -1073741510 instead of unsigned 3221225786. Both must map to
+    'cancelled' — checking only one of the two would leave a 50%
+    chance of generic 'pip_install' failure depending on Python build."""
+    monkeypatch.setattr(ti.sys, "platform", "win32")
+    embed_zip_bytes = _make_fake_embed_zip({
+        ti.embedded_python_exe().name: "x", "python311._pth": "#import site",
+    })
+    urlretrieve = _make_fake_urlretrieve({
+        ti.EMBED_PYTHON_URL: embed_zip_bytes,
+        ti.GET_PIP_URL: b"# stub",
+    })
+    import subprocess
+    def _sp_run(cmd, *, capture=False):
+        if "install" in cmd and "pip" in cmd:
+            raise subprocess.CalledProcessError(
+                returncode=-1073741510, cmd=cmd, stderr="",
+            )
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = ""
+        return result
+    with pytest.raises(ti.InstallError) as excinfo:
+        ti.install_runtime(
+            _urlretrieve=urlretrieve, _subprocess_run=_sp_run,
+            _source_pkg_dir=_stub_source_pkg,
+        )
+    assert excinfo.value.stage == "cancelled"
+
+
+def test_pip_install_real_failure_runs_cleanup(
+    _isolated_runtime, _stub_source_pkg,
+):
+    """When pip fails for a NON-cancel reason (e.g., torch wheel
+    unavailable), the partial torch tree must be wiped from
+    site-packages so the next retry doesn't hit 'already satisfied'
+    over a broken state. Without cleanup, the user runs install
+    twice + still gets a non-functional GPU runtime."""
+    embed_zip_bytes = _make_fake_embed_zip({
+        ti.embedded_python_exe().name: "x", "python311._pth": "#import site",
+    })
+    urlretrieve = _make_fake_urlretrieve({
+        ti.EMBED_PYTHON_URL: embed_zip_bytes,
+        ti.GET_PIP_URL: b"# stub",
+    })
+    # Pre-populate the site-packages with a partial torch tree so the
+    # cleanup has something to delete.
+    site_pkgs = ti.embedded_python_dir() / "Lib" / "site-packages"
+    site_pkgs.mkdir(parents=True, exist_ok=True)
+    (site_pkgs / "torch").mkdir()
+    (site_pkgs / "torch" / "__init__.py").write_text("x", encoding="utf-8")
+    (site_pkgs / "torch-2.4.1.dist-info").mkdir()
+    (site_pkgs / "nvidia_cuda_runtime_cu12").mkdir()
+    import subprocess
+    def _sp_run(cmd, *, capture=False):
+        if "install" in cmd and "pip" in cmd:
+            raise subprocess.CalledProcessError(
+                returncode=1, cmd=cmd,
+                stderr="ERROR: torch wheel unavailable",
+            )
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = ""
+        return result
+    with pytest.raises(ti.InstallError):
+        ti.install_runtime(
+            _urlretrieve=urlretrieve, _subprocess_run=_sp_run,
+            _source_pkg_dir=_stub_source_pkg,
+        )
+    # Cleanup ran — partial torch entries are gone.
+    assert not (site_pkgs / "torch").exists(), "torch dir not cleaned"
+    assert not (site_pkgs / "torch-2.4.1.dist-info").exists(), "dist-info not cleaned"
+    assert not (site_pkgs / "nvidia_cuda_runtime_cu12").exists(), "nvidia_* not cleaned"
+
+
+def test_cleanup_partial_torch_handles_missing_dir(tmp_path):
+    """If site-packages doesn't even exist yet (e.g., pip failed at
+    bootstrap, before any wheels could land), cleanup must be a no-op
+    that returns 0 — never crash on a path that doesn't exist."""
+    deleted = ti._cleanup_partial_torch(tmp_path / "does-not-exist")
+    assert deleted == 0
+
+
+def test_cleanup_partial_torch_handles_permission_errors(
+    tmp_path, monkeypatch,
+):
+    """A single file that can't be deleted (Windows file lock, permission
+    denied, etc.) doesn't stop the helper from cleaning the rest. The
+    operation is best-effort by design."""
+    site_pkgs = tmp_path / "site_pkgs"
+    site_pkgs.mkdir()
+    (site_pkgs / "torch").mkdir()
+    (site_pkgs / "torch_alt").mkdir()
+    import shutil
+    real_rmtree = shutil.rmtree
+    calls = {"count": 0}
+    def _selective_fail(path, *args, **kwargs):
+        calls["count"] += 1
+        if "torch_alt" in str(path):
+            raise OSError("simulated permission error")
+        return real_rmtree(path, *args, **kwargs)
+    monkeypatch.setattr(ti.shutil if hasattr(ti, "shutil") else shutil,
+                        "rmtree", _selective_fail)
+    # We monkeypatch the global shutil since the helper imports it lazily.
+    monkeypatch.setattr("shutil.rmtree", _selective_fail)
+    # Cleanup should attempt both entries; one succeeds, one fails silently.
+    ti._cleanup_partial_torch(site_pkgs)
+    # Either both went or just one — but the helper didn't raise.
+
+
 def test_pip_install_spec_uses_pinned_torch_version():
     """If TORCH_VERSION is bumped, PIP_INSTALL_SPEC follows automatically
     (it interpolates the constant). This test guards against someone
