@@ -539,6 +539,7 @@ class MainWindow(QMainWindow):
             "Inspired by forza-painter (the_adawg), built on the techniques of "
             "geometrize-lib (Sam Twidale) and Primitive (Michael Fogleman). "
             "LiveryGroup discovery approach adapted from bvzrays/forza-painter-fh6.<br><br>"
+            "Splash music: <b>“HELLO.SPIRAL”</b> by <b>CelesteAI</b>.<br><br>"
             "Repo: <a href='https://github.com/whykusanagi/forza-abyss-painter'>"
             "github.com/whykusanagi/forza-abyss-painter</a><br><br>"
             "If FH6 patches and injection breaks, the LiveryGroup offsets in "
@@ -733,52 +734,131 @@ class MainWindow(QMainWindow):
         """Inject the given shapes JSON into the running FH6 vinyl group.
         Opens a modal in-progress dialog (warns user not to touch FH6) and runs the
         injection in a background QThread. Status bar mirrors the same updates.
+
+        Bulletproof error handling: every step writes a breadcrumb to a debug
+        log at ~/Library/Logs/ForzaAbyssPainter/main_window_inject_debug.log
+        (or %LOCALAPPDATA%/ForzaAbyssPainter/logs/ on Windows) so silent
+        failures between user-clicks-OK and worker-thread-actually-starts
+        leave a paper trail. Previously a silent exception (eg in the picker
+        comparison or an import) would close the picker and do nothing
+        visible — exactly what the user reported.
         """
-        from forza_abyss_painter.inject import patterns_are_populated
-        from forza_abyss_painter.gui.inject_worker import InjectionWorker
-        from forza_abyss_painter.gui.inject_dialog import InjectionDialog
+        # ---- Breadcrumb logger (independent of the worker's log; the worker
+        # may never run if we crash before thread.start()).
+        from forza_abyss_painter.io.log_paths import log_root
+        from datetime import datetime, timezone
+        breadcrumb_path = log_root() / "main_window_inject_debug.log"
+        def _crumb(msg: str) -> None:
+            try:
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                with open(breadcrumb_path, "a", encoding="utf-8") as f:
+                    f.write(f"{ts} {msg}\n")
+            except Exception:
+                pass
+        _crumb(f"=== _on_inject_json_path entered: json={json_path} ===")
 
-        if not patterns_are_populated():
-            QMessageBox.warning(
-                self, "FH6 Injection",
-                "Patterns file is incomplete. Use FH6 → Discovery Workflow… to populate it."
-            )
-            return
-
-        if getattr(self, "_inject_thread", None) is not None:
-            QMessageBox.information(self, "Inject in progress", "An injection is already running. Wait for it to finish.")
-            return
-
-        target_key = self.settings_panel.selected_target_profile_key()
-        self._inject_worker = InjectionWorker(json_path, profile_key=target_key)
-        self._inject_thread = QThread(self)
-        self._inject_worker.moveToThread(self._inject_thread)
-
-        # Modal blocking dialog — labelled with the selected target so users
-        # see FH4 / FH5 / FH3 instead of always reading "FH6".
-        from forza_abyss_painter.inject.game_profiles import get_profile, default_profile
         try:
-            game_label = get_profile(target_key).label
-        except ValueError:
-            game_label = default_profile().label
-        self._inject_dialog = InjectionDialog(self, json_name=json_path.name, game_label=game_label)
+            from forza_abyss_painter.inject import patterns_are_populated
+            from forza_abyss_painter.gui.inject_worker import InjectionWorker
+            from forza_abyss_painter.gui.inject_dialog import InjectionDialog
+            from forza_abyss_painter.gui.inject_template_picker import TemplateSizePickerDialog
+            from forza_abyss_painter.io.exporter import load_json
+            _crumb("imports OK")
 
-        # Wire worker → both dialog and status bar
-        self._inject_worker.scan_progress.connect(self._inject_dialog.on_scan_progress)
-        self._inject_worker.write_progress.connect(self._inject_dialog.on_write_progress)
-        self._inject_worker.status.connect(self._inject_dialog.on_status)
-        self._inject_worker.done.connect(self._inject_dialog.on_done)
+            if not patterns_are_populated():
+                _crumb("patterns_are_populated False → abort")
+                QMessageBox.warning(
+                    self, "FH6 Injection",
+                    "Patterns file is incomplete. Use FH6 → Discovery Workflow… to populate it."
+                )
+                return
 
-        self._inject_worker.scan_progress.connect(self._on_inject_scan_progress)
-        self._inject_worker.write_progress.connect(self._on_inject_write_progress)
-        self._inject_worker.status.connect(self._on_inject_status)
-        self._inject_worker.done.connect(self._on_inject_done)
+            if getattr(self, "_inject_thread", None) is not None:
+                _crumb("inject_thread already exists → abort")
+                QMessageBox.information(self, "Inject in progress", "An injection is already running. Wait for it to finish.")
+                return
 
-        self._inject_thread.started.connect(self._inject_worker.run)
-        self._set_inject_status("Starting injection…", "info")
-        self._inject_thread.start()
-        # Show modal — blocks until close button enabled + user clicks Close
-        self._inject_dialog.exec()
+            # Read the JSON shape count up front so the template picker can
+            # show the user "your JSON has N shapes" + reject sizes that
+            # would overflow.
+            try:
+                doc_preview = load_json(str(json_path))
+                json_shape_count = len(doc_preview.materialize_shapes())
+                _crumb(f"json_shape_count = {json_shape_count}")
+            except Exception as exc:
+                _crumb(f"load_json failed: {type(exc).__name__}: {exc}")
+                QMessageBox.warning(
+                    self, "FH6 Injection",
+                    f"Could not read JSON to count shapes: {type(exc).__name__}: {exc}"
+                )
+                return
+
+            # Pre-inject template picker. exec() returns truthy (1) for OK,
+            # falsy (0) for Cancel. The obvious-looking instance-access form
+            # `picker[dot]Accepted` is BROKEN on PySide6 6.x — DialogCode
+            # enums don't propagate to subclass instances, so it raises
+            # AttributeError that Qt silently swallows in release builds
+            # (the user reported "window closes and nothing happens" from
+            # exactly that bug). Use truthiness OR QDialog.Accepted instead.
+            picker = TemplateSizePickerDialog(self, json_shape_count=json_shape_count)
+            _crumb("picker constructed; about to exec")
+            exec_result = picker.exec()
+            _crumb(f"picker.exec() returned {exec_result!r}")
+            if not exec_result:
+                _crumb("picker cancelled → return")
+                self.statusBar().showMessage("Injection cancelled at template selection.", 4000)
+                return
+            template_size = picker.selected_template_size
+            _crumb(f"picker.selected_template_size = {template_size!r}")
+
+            target_key = self.settings_panel.selected_target_profile_key()
+            _crumb(f"target_key = {target_key!r}")
+            self._inject_worker = InjectionWorker(
+                json_path, profile_key=target_key, template_size=template_size,
+            )
+            _crumb("InjectionWorker constructed")
+            self._inject_thread = QThread(self)
+            self._inject_worker.moveToThread(self._inject_thread)
+            _crumb("worker moved to thread")
+
+            from forza_abyss_painter.inject.game_profiles import get_profile, default_profile
+            try:
+                game_label = get_profile(target_key).label
+            except ValueError:
+                game_label = default_profile().label
+            self._inject_dialog = InjectionDialog(self, json_name=json_path.name, game_label=game_label)
+            _crumb("InjectionDialog constructed")
+
+            # Wire worker → both dialog and status bar
+            self._inject_worker.scan_progress.connect(self._inject_dialog.on_scan_progress)
+            self._inject_worker.write_progress.connect(self._inject_dialog.on_write_progress)
+            self._inject_worker.status.connect(self._inject_dialog.on_status)
+            self._inject_worker.log_path.connect(self._inject_dialog.on_log_path)
+            self._inject_worker.done.connect(self._inject_dialog.on_done)
+
+            self._inject_worker.scan_progress.connect(self._on_inject_scan_progress)
+            self._inject_worker.write_progress.connect(self._on_inject_write_progress)
+            self._inject_worker.status.connect(self._on_inject_status)
+            self._inject_worker.done.connect(self._on_inject_done)
+
+            self._inject_thread.started.connect(self._inject_worker.run)
+            self._set_inject_status("Starting injection…", "info")
+            _crumb("about to thread.start()")
+            self._inject_thread.start()
+            _crumb("thread.start() returned; entering dialog.exec()")
+            self._inject_dialog.exec()
+            _crumb("dialog.exec() returned (user closed)")
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            _crumb(f"!!! UNHANDLED EXCEPTION: {type(exc).__name__}: {exc}\n{tb}")
+            QMessageBox.critical(
+                self, "FH6 Injection — internal error",
+                f"Unexpected error setting up injection:\n\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                f"A trace was written to:\n{breadcrumb_path}\n\n"
+                f"Please share that file."
+            )
 
     def _set_inject_status(self, message: str, severity: str = "info") -> None:
         """Color-coded persistent status line at the bottom of the main window.

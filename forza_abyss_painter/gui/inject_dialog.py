@@ -120,8 +120,25 @@ class InjectionDialog(QDialog):
         root.addWidget(self.status_label)
         self._apply_severity_to_status("info")
 
-        # Close button — disabled until injection ends
+        # Log path footer — set when the worker emits log_path. Subdued
+        # styling because most users don't care, but it's there when they
+        # need to share the [fast-locate] miss lines with us after the dialog
+        # closes. Click to open the containing folder.
+        self.log_path_label = QLabel("")
+        self.log_path_label.setStyleSheet("color: #6a6a6a; font-size: 10px;")
+        self.log_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.log_path_label.setWordWrap(True)
+        root.addWidget(self.log_path_label)
+        self._log_path: str | None = None
+
+        # Close + Open log folder buttons. "Open log folder" appears only
+        # after we know the log path (worker emits it within the first second
+        # of the run).
         btn_row = QHBoxLayout()
+        self.open_log_btn = QPushButton("Open log folder")
+        self.open_log_btn.setEnabled(False)
+        self.open_log_btn.clicked.connect(self._open_log_folder)
+        btn_row.addWidget(self.open_log_btn)
         btn_row.addStretch()
         self.close_btn = QPushButton("Close")
         self.close_btn.setEnabled(False)
@@ -153,6 +170,30 @@ class InjectionDialog(QDialog):
         self.progress.setValue(pct)
         self.stage_label.setText("Stage 2 of 2 — Writing shapes")
         self.detail_label.setText(f"{written}/{total} shapes written")
+
+    def on_log_path(self, path: str) -> None:
+        """Worker emits this once at startup with the absolute log-file path."""
+        self._log_path = path
+        self.log_path_label.setText(f"Log: {path}")
+        self.open_log_btn.setEnabled(True)
+
+    def _open_log_folder(self) -> None:
+        """Open the platform file browser to the log directory."""
+        if not self._log_path:
+            return
+        import os
+        import subprocess
+        import sys
+        folder = os.path.dirname(self._log_path)
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder)   # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except OSError:
+            pass   # nothing useful to do; user can read the path from the label
 
     def on_done(self) -> None:
         # Allow user to dismiss now
