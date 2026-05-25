@@ -147,7 +147,9 @@ def test_install_runtime_fires_phases_in_order_with_monotonic_progress(
     })
     sp_run = _make_fake_subprocess_success(
         stdout_for_verify=json.dumps({
-            "cuda_available": True, "device_name": "FAKE GPU"
+            "cuda_available": True, "device_name": "FAKE GPU",
+            "compute_capability": [12, 0], "kernel_run_ok": True,
+            "torch_version": "2.7.0+cu128",
         }),
     )
 
@@ -183,7 +185,11 @@ def test_install_runtime_downloads_python_then_get_pip_in_that_order(
         ti.GET_PIP_URL: b"# get-pip stub",
     })
     sp_run = _make_fake_subprocess_success(
-        stdout_for_verify=json.dumps({"cuda_available": True, "device_name": "X"}),
+        stdout_for_verify=json.dumps({
+            "cuda_available": True, "device_name": "X",
+            "compute_capability": [8, 0], "kernel_run_ok": True,
+            "torch_version": "2.7.0+cu128",
+        }),
     )
     ti.install_runtime(
         _urlretrieve=urlretrieve, _subprocess_run=sp_run,
@@ -208,7 +214,11 @@ def test_install_runtime_runs_get_pip_before_pip_install(
         ti.GET_PIP_URL: b"# get-pip stub",
     })
     sp_run = _make_fake_subprocess_success(
-        stdout_for_verify=json.dumps({"cuda_available": True, "device_name": "X"}),
+        stdout_for_verify=json.dumps({
+            "cuda_available": True, "device_name": "X",
+            "compute_capability": [8, 0], "kernel_run_ok": True,
+            "torch_version": "2.7.0+cu128",
+        }),
     )
     ti.install_runtime(
         _urlretrieve=urlretrieve, _subprocess_run=sp_run,
@@ -243,7 +253,9 @@ def test_install_runtime_writes_marker_with_cuda_verdict(
     })
     sp_run = _make_fake_subprocess_success(
         stdout_for_verify=json.dumps({
-            "cuda_available": False, "device_name": ""
+            "cuda_available": False, "device_name": "",
+            "compute_capability": None, "kernel_run_ok": False,
+            "torch_version": "2.7.0",   # CPU-only wheel landed
         }),
     )
     info = ti.install_runtime(
@@ -665,6 +677,104 @@ def test_cleanup_partial_torch_handles_permission_errors(
     # Cleanup should attempt both entries; one succeeds, one fails silently.
     ti._cleanup_partial_torch(site_pkgs)
     # Either both went or just one — but the helper didn't raise.
+
+
+def test_verify_cuda_raises_on_kernel_mismatch_even_when_available(
+    _isolated_runtime, _stub_source_pkg,
+):
+    """RTX 50-series regression: cu121 wheels report
+    torch.cuda.is_available() == True on sm_120 hardware (driver
+    reports the device fine), but the first actual kernel launch
+    crashes with 'no kernel image available'. The new verify probe
+    runs a real kernel and surfaces this mismatch AS an install
+    failure — otherwise the marker says cuda=True and the user hits
+    a generic error at first Generate, far from the install context."""
+    embed_zip_bytes = _make_fake_embed_zip({
+        ti.embedded_python_exe().name: "x", "python311._pth": "#import site",
+    })
+    urlretrieve = _make_fake_urlretrieve({
+        ti.EMBED_PYTHON_URL: embed_zip_bytes,
+        ti.GET_PIP_URL: b"# stub",
+    })
+    sp_run = _make_fake_subprocess_success(
+        stdout_for_verify=json.dumps({
+            "cuda_available": True,                # device IS visible
+            "device_name": "NVIDIA RTX 5090",
+            "compute_capability": [12, 0],         # sm_120 — Blackwell
+            "kernel_run_ok": False,                # but kernel launch failed
+            "torch_version": "2.4.1+cu121",        # OLD wheels lacking sm_120
+            "error": "CUDA error: no kernel image is available "
+                     "for execution on the device",
+        }),
+    )
+    with pytest.raises(ti.InstallError) as excinfo:
+        ti.install_runtime(
+            _urlretrieve=urlretrieve, _subprocess_run=sp_run,
+            _source_pkg_dir=_stub_source_pkg,
+        )
+    assert excinfo.value.stage == "verify_cuda"
+    # Error message must name the device + sm_* so the user knows
+    # which case they're in (vs a generic CUDA verify failure).
+    msg = excinfo.value.message
+    assert "RTX 5090" in msg
+    assert "sm_120" in msg
+    assert "no CUDA kernel runs" in msg or "no kernel image" in msg
+    # And references the cu128 + 2.7 pin so the user knows what to
+    # upgrade to (or that this EXE is older than the cu128 bump).
+    assert "cu128" in msg or "2.7" in msg
+
+
+def test_verify_cuda_accepts_modern_cards_running_a_kernel(
+    _isolated_runtime, _stub_source_pkg,
+):
+    """Happy path for modern cards with cu128 wheels: kernel runs,
+    install completes, marker reflects the device. Mirrors the
+    existing happy-path test but ALSO asserts the new
+    compute_capability + kernel_run_ok fields flow into the log."""
+    embed_zip_bytes = _make_fake_embed_zip({
+        ti.embedded_python_exe().name: "x", "python311._pth": "#import site",
+    })
+    urlretrieve = _make_fake_urlretrieve({
+        ti.EMBED_PYTHON_URL: embed_zip_bytes,
+        ti.GET_PIP_URL: b"# stub",
+    })
+    sp_run = _make_fake_subprocess_success(
+        stdout_for_verify=json.dumps({
+            "cuda_available": True,
+            "device_name": "NVIDIA RTX 4090",
+            "compute_capability": [8, 9],          # Ada
+            "kernel_run_ok": True,                 # real kernel ran
+            "torch_version": "2.7.0+cu128",
+        }),
+    )
+    info = ti.install_runtime(
+        _urlretrieve=urlretrieve, _subprocess_run=sp_run,
+        _source_pkg_dir=_stub_source_pkg,
+    )
+    assert info.cuda_available is True
+    assert info.cuda_device_name == "NVIDIA RTX 4090"
+
+
+def test_cu128_index_and_torch_2_7_pinned():
+    """Pin the cu128 + 2.7+ wheel set so a regression back to cu121
+    (which blocks RTX 50-series) fails loud. cu128 wheels include
+    sm_50-sm_120 so this isn't a downgrade for older cards.
+
+    If pytorch.org ships a new wheel index (cu129, cu130, etc.), bump
+    BOTH constants together — the index URL and the minimum torch
+    version are coupled. Don't update one without the other.
+    """
+    assert ti.TORCH_CUDA_INDEX.endswith("/cu128"), (
+        f"TORCH_CUDA_INDEX={ti.TORCH_CUDA_INDEX} — must end with /cu128 "
+        f"to include sm_120 kernels for RTX 50-series. cu121 wheels lack "
+        f"sm_120 SASS and crash at first kernel launch on Blackwell."
+    )
+    major, minor, _patch = ti.TORCH_VERSION.split(".")
+    assert int(major) >= 2 and int(minor) >= 7, (
+        f"TORCH_VERSION={ti.TORCH_VERSION} — must be ≥ 2.7.x to ship "
+        f"with cu128 binaries from pytorch.org. Older torch versions "
+        f"don't have cu128 builds + don't include sm_120."
+    )
 
 
 def test_pip_install_spec_uses_pinned_torch_version():

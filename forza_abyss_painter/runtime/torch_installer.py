@@ -41,11 +41,20 @@ EMBED_PYTHON_URL = (
     f"https://www.python.org/ftp/python/{EMBED_PYTHON_VERSION}/"
     f"python-{EMBED_PYTHON_VERSION}-embed-amd64.zip"
 )
-TORCH_VERSION = "2.4.1"
-# PyTorch CUDA index URL for the matching wheel set. The bare version
-# (without +cu121) installs from CPU-only PyPI; this index serves the
-# CUDA-enabled wheels.
-TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu121"
+# Torch + CUDA wheel set. Bumped to cu128 / 2.7+ to cover RTX 50-series
+# (Blackwell, sm_120) which cu121 wheels don't include kernels for.
+# cu128 wheels include sm_50–sm_120 so older cards (RTX 20/30/40
+# series) keep working — the bump is purely additive for them.
+#
+# Why this bump matters: RTX 5090 testers saw `install passes` (torch
+# was imported, is_available() returned True, get_device_name() worked)
+# but the first real tensor op crashed with
+#     RuntimeError: CUDA error: no kernel image is available for execution on the device
+# because the cu121 binaries we shipped have no sm_120 SASS. verify_cuda
+# now actually executes a kernel (see _verify_cuda_runs_kernel) so this
+# fails at install time on cu121-on-sm_120, not at first generate.
+TORCH_VERSION = "2.7.0"
+TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
 GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 
 
@@ -296,10 +305,30 @@ def _source_package_dir() -> Path:
     that's currently importing this module. Used by install_runtime to
     locate the source tree to copy into the embedded site-packages.
 
-    Works in both dev (checked-out source) and PyInstaller-frozen EXE
-    (where __file__ points into the _MEIPASS extracted runtime).
+    PyInstaller onefile mode is the tricky case: imported modules live
+    in the PYZ archive (not as on-disk dirs in _MEIPASS) unless they
+    were added via `--add-data` / `datas=` in the spec. We bundle
+    shapegen/io/runtime via the spec for exactly this reason — so the
+    `Path(__file__).parent.parent` path resolves to a real on-disk
+    directory tree in the _MEI extraction even when frozen.
+
+    If that path doesn't actually contain the required subpackage dirs
+    (the install would crash in _copy_runner_package), prefer
+    sys._MEIPASS / 'forza_abyss_painter' as a fallback — covers the
+    case where the spec was rebuilt without our datas entries.
     """
-    return Path(__file__).resolve().parent.parent
+    candidate = Path(__file__).resolve().parent.parent
+    # Frozen mode: __file__ points into _MEIPASS. If the candidate dir
+    # doesn't contain shapegen/, fall back to the bundled-datas path
+    # explicitly under sys._MEIPASS so the error message names the
+    # right cause (missing --add-data, not missing source).
+    if getattr(sys, "frozen", False) and not (candidate / "shapegen").is_dir():
+        mei = Path(getattr(sys, "_MEIPASS", ""))
+        if mei:
+            fallback = mei / "forza_abyss_painter"
+            if (fallback / "shapegen").is_dir():
+                return fallback
+    return candidate
 
 
 def _copy_runner_package(
@@ -578,7 +607,29 @@ def install_runtime(
     site_pkgs.mkdir(parents=True, exist_ok=True)
     try:
         _copy_runner_package(src_pkg, site_pkgs)
-    except InstallError:
+    except InstallError as exc:
+        # The 'required subpackage missing' raise is generic. Catch and
+        # rewrite the message if we're under _MEI* — that's the
+        # PyInstaller-onefile-without-our-datas case, and the user can
+        # only fix it by rebuilding the EXE. The generic 'permissions
+        # or disk space' hint sent users on a wild goose chase.
+        if (str(src_pkg).find("_MEI") >= 0 and
+                getattr(sys, "frozen", False) and
+                "missing from source" in exc.message):
+            raise InstallError(
+                stage="copy_package",
+                message=(
+                    f"{exc.message}\n\n"
+                    f"This is a build issue, NOT a problem with your "
+                    f"machine: the EXE was packaged without "
+                    f"`--add-data` entries for shapegen/io/runtime, so "
+                    f"those packages are only in the PyInstaller PYZ "
+                    f"archive (not as on-disk folders the installer can "
+                    f"copy). Rebuild the EXE with the current "
+                    f"ForzaAbyssPainter.spec / build_exe.bat — those "
+                    f"files include the required `--add-data` flags."
+                ),
+            ) from exc
         raise
     except Exception as exc:
         raise InstallError(
@@ -596,24 +647,81 @@ def install_runtime(
     _report(85, "Verifying CUDA availability")
     cuda_available = False
     cuda_device_name = ""
+    # Probe runs a REAL kernel — torch.zeros(1, device='cuda') — not
+    # just is_available(). The old probe (just is_available() +
+    # get_device_name()) passed on RTX 5090 with cu121 wheels because
+    # the runtime reports the device fine; only the first kernel
+    # launch fails with "no kernel image available". Running a kernel
+    # at verify time means a cu121-on-sm_120 mismatch surfaces NOW
+    # with stage='verify_cuda' rather than later as a generation
+    # error the user doesn't know how to interpret.
+    #
+    # Also captures get_device_capability() so we can detect sm_120+
+    # boards explicitly and emit a targeted error if the installed
+    # torch wheel doesn't support them (currently anything < 2.7+cu128).
+    probe_script = (
+        "import json, sys, traceback, torch\n"
+        "info = {'cuda_available': False, 'device_name': '', "
+        "'compute_capability': None, 'kernel_run_ok': False, "
+        "'torch_version': torch.__version__}\n"
+        "try:\n"
+        "    info['cuda_available'] = torch.cuda.is_available()\n"
+        "    if info['cuda_available']:\n"
+        "        info['device_name'] = torch.cuda.get_device_name(0)\n"
+        "        cap = torch.cuda.get_device_capability(0)\n"
+        "        info['compute_capability'] = list(cap)\n"
+        "        # Real kernel — fails with 'no kernel image available' "
+        "        # if torch wheel doesn't support this device's sm_*.\n"
+        "        x = torch.zeros(1, device='cuda')\n"
+        "        x.add_(1)\n"
+        "        info['kernel_run_ok'] = True\n"
+        "except Exception as exc:\n"
+        "    info['error'] = f'{type(exc).__name__}: {exc}'\n"
+        "print(json.dumps(info))\n"
+    )
     try:
         with _logger.start_phase("verify_cuda"):
             proc = sp_run(
-                [str(embed_exe), "-c",
-                 "import json, torch; "
-                 "info = {'cuda_available': torch.cuda.is_available(), "
-                 "'device_name': torch.cuda.get_device_name(0) "
-                 "if torch.cuda.is_available() else ''}; "
-                 "print(json.dumps(info))"],
+                [str(embed_exe), "-c", probe_script],
                 capture=True,
             )
             out = proc.stdout.strip().splitlines()[-1]
             verdict = json.loads(out)
             cuda_available = bool(verdict.get("cuda_available", False))
             cuda_device_name = str(verdict.get("device_name", ""))
+            kernel_ok = bool(verdict.get("kernel_run_ok", False))
+            cc = verdict.get("compute_capability")  # [major, minor] or None
             _logger.log("cuda_verdict",
                         cuda_available=cuda_available,
-                        cuda_device_name=cuda_device_name)
+                        cuda_device_name=cuda_device_name,
+                        compute_capability=cc,
+                        kernel_run_ok=kernel_ok,
+                        probe_error=verdict.get("error"))
+            # If torch reports CUDA available but the kernel won't run,
+            # we have a wheel-vs-device mismatch (e.g., cu121 on sm_120).
+            # Surface it AS an install failure — otherwise the marker
+            # says cuda_available=True and the user hits the error
+            # later at first generate, with no context.
+            if cuda_available and not kernel_ok:
+                sm = (f"sm_{cc[0]}{cc[1]}" if cc else "unknown")
+                detail = verdict.get("error", "(no error captured)")
+                raise InstallError(
+                    stage="verify_cuda",
+                    message=(
+                        f"torch installed but no CUDA kernel runs on this "
+                        f"GPU ({cuda_device_name}, {sm}). The installed "
+                        f"wheel ({verdict.get('torch_version', '?')}) "
+                        f"doesn't include kernels for your device.\n\n"
+                        f"For RTX 50-series cards (sm_120+), you need "
+                        f"torch ≥ 2.7 with cu128 wheels. The current "
+                        f"installer pins TORCH_VERSION={TORCH_VERSION} "
+                        f"+ {TORCH_CUDA_INDEX} — if this error appears, "
+                        f"the EXE is older than the cu128 bump.\n\n"
+                        f"Probe detail: {detail}"
+                    ),
+                )
+    except InstallError:
+        raise
     except Exception as exc:
         raise InstallError(
             stage="verify_cuda",

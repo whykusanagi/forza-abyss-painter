@@ -63,6 +63,12 @@ hiddenimports = [
 datas = [
     ("forza_abyss_painter/settings/profiles", "forza_abyss_painter/settings/profiles"),
     ("forza_abyss_painter/inject/patterns", "forza_abyss_painter/inject/patterns"),
+    # GPU runtime install copies these subpackages as directory trees into embedded
+    # site-packages. PyInstaller onefile otherwise keeps .py only in PYZ (no shapegen/
+    # io/runtime folders on disk) and torch_installer copy_package fails.
+    ("forza_abyss_painter/shapegen", "forza_abyss_painter/shapegen"),
+    ("forza_abyss_painter/io", "forza_abyss_painter/io"),
+    ("forza_abyss_painter/runtime", "forza_abyss_painter/runtime"),
     ("SplashScreen.mp4", "."),
     ("Song1OpenSource.mp3", "."),
     ("Song2OpenSource.mp3", "."),

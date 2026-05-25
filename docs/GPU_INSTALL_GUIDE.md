@@ -65,12 +65,34 @@ auto-cleaned so pip won't get confused on the second attempt.
 Network issue downloading the embedded Python zip or get-pip.py.
 **Recovery:** check internet, retry.
 
-### "Install failed at verify_cuda"
+### "Install failed at verify_cuda" — generic case
 
-torch installed cleanly but CUDA initialization failed. Almost
-always: Nvidia driver too old for the cu121 wheels we ship.
-**Recovery:** update your Nvidia driver from nvidia.com (you want
-≥ 525.x), then re-run install.
+torch installed cleanly but CUDA initialization failed. The most
+common cause: Nvidia driver too old. **Recovery:** update your Nvidia
+driver from nvidia.com (you want ≥ 525.x for cu128 wheels), then
+re-run install.
+
+### "Install failed at verify_cuda" — "no CUDA kernel runs on this GPU"
+
+You're on an RTX 50-series card (Blackwell, sm_120) and the installer
+shipped a torch wheel that doesn't have sm_120 kernels. The installer
+detects this by running a real kernel during verify, so this fails
+NOW instead of silently slipping past install + crashing on first
+Generate.
+
+**As of this build:** the installer pins **`TORCH_CUDA_INDEX=cu128`**
+and **`TORCH_VERSION=2.7.0`** — cu128 wheels include sm_50 through
+sm_120 so all RTX 20/30/40/50 cards work out of the box.
+
+**If you still see this error** after the cu128 bump landed: it
+means the EXE you're running was built BEFORE the bump. Rebuild from
+the latest source on SMB or pull a newer Release.
+
+**RTX 5090 / 5080 / 5070 specific:** if you're on the older cu121
+EXE, run the workaround script
+`diagnostics/upgrade_embedded_torch_cu128.ps1` (on the SMB build
+share) to re-pip the embedded runtime to cu128 nightly — that
+unblocks you until the new EXE lands.
 
 ### "Install incomplete (CPU-only torch)"
 
