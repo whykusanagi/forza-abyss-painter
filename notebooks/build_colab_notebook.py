@@ -80,6 +80,99 @@ CELL_FOOTER = f"""<div align="center" style="margin-top: 32px; padding: 16px; bo
 </div>
 """
 
+CELL_VRAM_AUTOPICKER = '''# --- VRAM autopicker — what preset should you use? ---
+# Probes:
+#   (a) Free VRAM via torch.cuda.mem_get_info() — what's actually available
+#       right now, not just total card capacity.
+#   (b) Whether forzahorizon6.exe is running (local-Windows only — Colab
+#       always reports False since the game can't run there). On Windows
+#       with FH6 open, the game holds 4-6 GiB of VRAM, so shape-gen has to
+#       share. On Colab the GPU is dedicated.
+# Then prints a recommendation table mapping (free_vram, fh6_running) →
+# notebook preset. You manually open the recommended notebook if it differs
+# from the one you're in. Future work: auto-adjust this notebook's Configure
+# defaults to match the recommendation.
+import torch
+
+try:
+    import psutil
+    _PSUTIL_OK = True
+except ImportError:
+    _PSUTIL_OK = False
+    print("(psutil not installed — skipping FH6 process detect. pip install psutil to enable.)")
+
+def _fh6_running() -> bool:
+    """Return True iff forzahorizon6.exe is in the current process list. False
+    on non-Windows systems or when psutil is missing — Colab always returns
+    False since the game can't run in the Colab runtime."""
+    if not _PSUTIL_OK:
+        return False
+    targets = {"forzahorizon6.exe", "forzahorizon6-win64-shipping.exe"}
+    for p in psutil.process_iter(["name"]):
+        try:
+            n = (p.info["name"] or "").lower()
+            if n in targets:
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return False
+
+def _gpu_state():
+    """Returns (gpu_name, free_gib, total_gib) or (None, 0, 0) if no CUDA."""
+    if not torch.cuda.is_available():
+        return (None, 0.0, 0.0)
+    free_b, total_b = torch.cuda.mem_get_info()
+    name = torch.cuda.get_device_name(0)
+    return (name, free_b / (1 << 30), total_b / (1 << 30))
+
+_gpu_name, _free_gib, _total_gib = _gpu_state()
+_fh6 = _fh6_running()
+
+print(f"GPU:        {_gpu_name or '(no CUDA)'}")
+if _gpu_name:
+    print(f"VRAM:       {_free_gib:.1f} GiB free / {_total_gib:.1f} GiB total")
+print(f"FH6 running: {'YES — sharing the GPU' if _fh6 else 'no (or undetectable)'}")
+print()
+
+# Decision matrix: (free_gib_floor, fh6_running) → recommended notebook name.
+# Floors are lower bounds — if you have >= floor GiB free, you can use this preset.
+# Tuned conservatively: ~30% headroom buffer to absorb peak overshoot beyond the
+# resolution planner's estimate.
+_recs = []
+if _fh6:
+    if _free_gib >= 12:
+        _recs.append(("fap_gpu_local_consumer_1000", "1000 shapes, MAX_RES=720, FH6-coresident OK"))
+    elif _free_gib >= 6:
+        _recs.append(("fap_gpu_local_consumer_700", "700 shapes, MAX_RES=600"))
+    elif _free_gib >= 3:
+        _recs.append(("fap_gpu_local_consumer_400", "400 shapes, MAX_RES=480"))
+    else:
+        _recs.append((None, f"<3 GiB free with FH6 running — close the game first OR open a fap_gpu_colab_*.ipynb on Colab"))
+else:
+    if _free_gib >= 24:
+        _recs.append(("fap_gpu_colab_highres_3000 / fap_gpu_local_overnight_3000", "3000 shapes, MAX_RES=1600, full quality"))
+    elif _free_gib >= 12:
+        _recs.append(("fap_gpu_colab_medium_1000 / fap_gpu_local_overnight_1000", "1000 shapes, MAX_RES=1000"))
+    elif _free_gib >= 6:
+        _recs.append(("fap_gpu_colab_headshots_700", "700 shapes, MAX_RES=900"))
+    elif _free_gib > 0:
+        _recs.append(("fap_gpu_colab_lineart_400", "400 shapes, MAX_RES=720"))
+    else:
+        _recs.append((None, "no CUDA available — runtime needs Hardware Accelerator: GPU"))
+
+print("RECOMMENDATION based on your environment:")
+for nb, desc in _recs:
+    if nb:
+        print(f"  → {nb}.ipynb  ({desc})")
+    else:
+        print(f"  → {desc}")
+print()
+print("If you're not in the recommended notebook, open it instead of continuing here.")
+print("If you ARE in the recommended notebook (or accept the risk of a heavier one),")
+print("continue to the next cell.")
+'''
+
+
 CELL_SETUP_DEPS = """# --- Environment check ---
 import sys, time
 import numpy as np
@@ -715,6 +808,8 @@ def build(preset_key):
             code(CELL_SETUP_DEPS),
             md("## 2. Setup — load the Forza Abyss Painter GPU engine\n\nRun this cell once per session. It defines `run_gpu(...)` and helpers."),
             code(CELL_SETUP_ENGINE),
+            md("## 2.5 VRAM autopicker — **am I in the right notebook?**\n\nProbes free VRAM and whether FH6 is running locally. Prints a recommended notebook variant based on what your environment can support. If you're already in the right one, continue. If not, open the recommended one instead — same workflow, settings tuned for your card."),
+            code(CELL_VRAM_AUTOPICKER),
             md("## 3. 🧹 Cleanup (run between attempts)\n\nUse this if a previous run OOM'd or you want to start fresh with different parameters. If `allocated` stays >1 GB after this cell, restart the runtime (Runtime → Restart runtime)."),
             code(CELL_CLEANUP),
             md("## 4. Mount Google Drive (persistent output)\n\n**This is the key cell for not losing results.** Outputs save straight to Drive the instant generation finishes, plus checkpoints during the run — so a session reset / disconnect can't lose your JSON + PNG. You'll be prompted to authorize Drive access."),
