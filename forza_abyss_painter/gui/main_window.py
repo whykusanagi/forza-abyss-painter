@@ -188,6 +188,19 @@ class MainWindow(QMainWindow):
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
 
+        # ---- Tools menu — local GPU shape-gen entry point.
+        # First click triggers the runtime-install prompt (~4 GiB one-time
+        # download). Subsequent clicks open the Generate dialog directly.
+        # See forza_abyss_painter/runtime/ + gui/generate_dialog.py.
+        tools_menu = mbar.addMenu("&Tools")
+        generate_act = QAction("&Generate shapes locally (GPU)…", self)
+        generate_act.setStatusTip(
+            "Run the GPU shape-generator on your local CUDA card "
+            "(requires one-time ~4 GiB runtime download)"
+        )
+        generate_act.triggered.connect(self._on_generate_locally)
+        tools_menu.addAction(generate_act)
+
         view_menu = mbar.addMenu("&View")
         theme_menu = view_menu.addMenu("&Theme")
         from PySide6.QtGui import QActionGroup
@@ -572,6 +585,26 @@ class MainWindow(QMainWindow):
             "Inject the most recent shapes into a running FH6 vinyl group."
         )
         self.settings_panel.inject_btn.setToolTip(tip)
+
+    def _on_generate_locally(self) -> None:
+        """Tools menu → Generate shapes locally. Lazy-import the dialog so
+        the runtime modules don't get loaded on startup (kept off the hot
+        path for inject-only users). If runtime isn't installed yet, the
+        helper prompts the user; on success or already-installed it opens
+        the generate-workflow dialog, then auto-loads the resulting JSON
+        into the preview panel using the existing Upload JSON flow."""
+        from forza_abyss_painter.gui.generate_dialog import (
+            open_generate_dialog_if_runtime_ready,
+        )
+        out = open_generate_dialog_if_runtime_ready(self)
+        if out is not None and out.exists():
+            # Reuse the existing JSON-load preview path so the generated
+            # output flows through the same preview + inject lineup as an
+            # Upload JSON-sourced file.
+            self._on_json_loaded_for_preview(out)
+            self.statusBar().showMessage(
+                f"Generated {out.name} — ready to inject.", 8000,
+            )
 
     def _on_files_selected(self, paths: list[Path]) -> None:
         if self._suite_mode == SuiteMode.AC:
