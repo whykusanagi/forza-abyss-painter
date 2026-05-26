@@ -522,6 +522,37 @@ class MainWindow(QMainWindow):
         self._apply_suite_mode(mode)
         save_suite_mode(mode)
 
+    def _prompt_gpu_install_on_first_launch(self) -> None:
+        """First-launch CUDA detection + install offer (#99).
+
+        Self-gates via `should_prompt()` — does nothing if the runtime
+        is already installed, the user previously opted out, the
+        GPU_PHASE_3_AVAILABLE flag is off, or no NVIDIA GPU is
+        present. On 'Install now', chains into the existing
+        RuntimeInstallDialog so users land in the same flow they'd
+        get from Tools → Install GPU runtime.
+        """
+        from forza_abyss_painter.gui.gpu_first_launch import (
+            GpuPromptDecision, maybe_prompt,
+        )
+        result = maybe_prompt(self)
+        if result.decision is GpuPromptDecision.INSTALL_NOW:
+            # Reuse the existing install dialog — single source of
+            # truth for the install flow (download progress, error
+            # handling, marker write-back).
+            from forza_abyss_painter.gui.runtime_install_dialog import (
+                RuntimeInstallDialog,
+            )
+            dlg = RuntimeInstallDialog(self)
+            dlg.exec()
+            # After the install finishes we refresh the status bar so
+            # the GPU label flips from "not installed" to "ready" on
+            # the spot, without the user needing to re-open menus.
+            try:
+                self._refresh_gpu_status_indicator()
+            except Exception:
+                pass   # status bar is decorative — don't break flow
+
     def _prompt_suite_on_first_launch(self) -> None:
         """Show the 4-tile suite picker if the user has never picked one.
 
@@ -1579,6 +1610,14 @@ class MainWindow(QMainWindow):
             # One event-loop tick of delay so the window has fully painted
             # before the modal blocks it — avoids a black-frame flash.
             QTimer.singleShot(0, self._prompt_suite_on_first_launch)
+        # GPU install offer (#99). Fires AFTER the suite picker so the
+        # user isn't hit with two modals at once on a brand-new session.
+        # Self-gates internally (skips when already installed / opted
+        # out / no NVIDIA GPU). Runs once per session via a flag so
+        # window-show events on focus toggles don't re-trigger.
+        if not getattr(self, "_gpu_first_launch_checked", False):
+            self._gpu_first_launch_checked = True
+            QTimer.singleShot(50, self._prompt_gpu_install_on_first_launch)
         if hasattr(self, "particles") and self.particles is not None:
             self.particles.reposition()
             self._sync_particle_exclude_rect()
