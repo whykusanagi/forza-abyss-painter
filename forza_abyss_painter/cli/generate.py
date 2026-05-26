@@ -17,7 +17,7 @@ wrong tool. Painter-fh6's bundled OpenCL tool exposes `-settings` +
     fap-generate --image SOURCE.png --output OUT.json \\
                  --num-shapes 1000 --max-resolution 720 \\
                  --random-samples 8192 \\
-                 [--vram-budget 8] [--sticker]
+                 [--vram-budget 8] [--sticker] [--bbox-local | --full-canvas]
 
 Prints progress to stderr (same JSON-line schema torch_runner emits
 over IPC). Final exit code 0 on success, 1 on engine error, 2 on
@@ -99,6 +99,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="torch device. 'cpu' is for testing only — generation is "
              "absurdly slow without GPU.",
     )
+    bbox_mode = parser.add_mutually_exclusive_group()
+    bbox_mode.add_argument(
+        "--bbox-local", dest="bbox_local", action="store_true",
+        default=True,
+        help="(default) Use bbox-local scoring — small per-candidate "
+             "crops, low VRAM peak. Required for ellipse-only runs on "
+             "consumer GPUs. See vram_planner.py for the math.",
+    )
+    bbox_mode.add_argument(
+        "--full-canvas", dest="bbox_local", action="store_false",
+        help="Use full-canvas scoring — per-candidate masks cover the "
+             "whole canvas. Required for multi-shape (rectangle, "
+             "triangle) but OOMs on 32 GiB GPUs at K > 1024 without "
+             "chunked rasterize (#129). Use for diagnostic A/B against "
+             "the bbox-local baseline (Cursor's T1.2).",
+    )
     return parser
 
 
@@ -135,6 +151,7 @@ def main(argv: "list[str] | None" = None) -> int:
         "lock_alpha": True,   # hard system constraint per CLAUDE.md §3
         "preset_label": str(args.preset_label),
         "device": str(args.device),
+        "bbox_local": bool(args.bbox_local),
     }
 
     try:
