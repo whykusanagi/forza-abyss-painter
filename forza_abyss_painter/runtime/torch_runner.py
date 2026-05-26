@@ -381,6 +381,228 @@ def _install_graceful_shutdown_handler(stream, logger) -> None:
         _signal.signal(_signal.SIGTERM, _shutdown)
 
 
+def _run_polish_only(cfg: RunConfig, stream, logger) -> int:
+    """Polish branch for mode='polish_only'. Loads the source image +
+    the existing shapes JSON, builds the joint_polish target (matching
+    engine.py's construction at lines 460-570 of engine.py), runs the
+    polish optimizer with freeze_geometry=True, saves the refined
+    shapes via the canonical save_json path.
+
+    All non-ellipse shapes are rejected here so the user gets a clean
+    error before any GPU work starts (joint_polish only handles
+    rotated_ellipse — engine.py:697 has the matching gate).
+    """
+    # Import inside the function so the import-error exit code (3) still
+    # applies if torch isn't installed.
+    try:
+        with logger.start_phase("import_engine"):
+            import torch  # noqa: F401
+            import numpy as np
+            from forza_abyss_painter.shapegen.gpu.joint_polish import joint_polish
+            from forza_abyss_painter.shapegen.gpu.engine import (
+                _posterize, _edge_weight_map, DTYPE, get_device,
+            )
+    except ImportError as exc:
+        emit(stream, {
+            "kind": "error", "stage": "import_engine",
+            "message": (
+                f"{type(exc).__name__}: {exc}. The GPU runtime isn't "
+                f"fully installed in this Python — run the runtime "
+                f"installer from Tools → Generate shapes locally first."
+            ),
+        })
+        return 3
+
+    # Load shapes JSON first — canvas dims come from doc.image_size, NOT
+    # from cfg.max_resolution. This is the key polish_only invariant:
+    # polish operates on the canvas the shapes were generated for.
+    try:
+        with logger.start_phase("load_shapes_json",
+                                  shapes_path=str(cfg.input_shapes_path)):
+            from forza_abyss_painter.io.exporter import load_json, save_json
+            from forza_abyss_painter.io.json_schema import FD6Document
+            doc = load_json(str(cfg.input_shapes_path))
+            shapes_json = list(doc.shapes)
+            logger.log("shapes_loaded",
+                       shape_count=len(shapes_json),
+                       image_size=list(doc.image_size))
+    except (OSError, ValueError, KeyError) as exc:
+        emit(stream, {
+            "kind": "error", "stage": "load_shapes_json",
+            "message": f"{type(exc).__name__}: {exc}",
+        })
+        return 1
+
+    # Polish only supports rotated_ellipse (joint_polish builds a
+    # (N, 5) geometry tensor expecting x/y/rx/ry/angle). Reject other
+    # shape types early.
+    if not shapes_json:
+        emit(stream, {
+            "kind": "error", "stage": "polish_only_empty_input",
+            "message": (
+                f"input_shapes_path {cfg.input_shapes_path} has zero "
+                f"shapes — nothing to polish."
+            ),
+        })
+        return 1
+    non_ellipse = [s for s in shapes_json if s.get("type") != "rotated_ellipse"]
+    if non_ellipse:
+        kinds = sorted({s.get("type", "?") for s in non_ellipse})
+        emit(stream, {
+            "kind": "error", "stage": "polish_only_unsupported_shape",
+            "message": (
+                f"polish_only supports rotated_ellipse only; found "
+                f"{len(non_ellipse)} non-ellipse shape(s) of type(s) "
+                f"{kinds} in {cfg.input_shapes_path.name}. Polish "
+                f"skipped."
+            ),
+        })
+        return 1
+
+    if doc.image_size[0] <= 0 or doc.image_size[1] <= 0:
+        emit(stream, {
+            "kind": "error", "stage": "polish_only_invalid_canvas",
+            "message": (
+                f"loaded JSON has image_size={doc.image_size}; polish "
+                f"requires a positive canvas size."
+            ),
+        })
+        return 1
+    canvas_w, canvas_h = int(doc.image_size[0]), int(doc.image_size[1])
+
+    # Load + resize source image to the loaded JSON's canvas.
+    try:
+        with logger.start_phase("load_image", image_path=str(cfg.image_path)):
+            from PIL import Image
+            img = Image.open(cfg.image_path)
+            sticker = cfg.sticker_mode or bool(getattr(doc, "sticker_mode", False))
+            if sticker:
+                rgba = img.convert("RGBA").resize(
+                    (canvas_w, canvas_h), Image.LANCZOS)
+                arr = np.asarray(rgba, dtype=np.uint8)
+                rgb = arr[:, :, :3].copy()
+                alpha_mask = arr[:, :, 3].copy()
+            else:
+                rgb = np.asarray(
+                    img.convert("RGB").resize((canvas_w, canvas_h), Image.LANCZOS),
+                    dtype=np.uint8,
+                )
+                alpha_mask = None
+            logger.log("image_loaded_for_polish",
+                       canvas_size=[canvas_w, canvas_h],
+                       has_alpha=alpha_mask is not None)
+    except (OSError, ValueError) as exc:
+        emit(stream, {
+            "kind": "error", "stage": "load_image",
+            "message": f"{type(exc).__name__}: {exc}",
+        })
+        return 1
+
+    # Build polish inputs mirroring engine.py's construction. Posterize +
+    # alpha substrate fill happen the same way; the only difference is we
+    # start from the FINAL canvas (rendered from the loaded shapes) so
+    # joint_polish sees the same baseline the engine would have at this
+    # point in a fresh run.
+    try:
+        with logger.start_phase("build_polish_inputs"):
+            device = get_device() if cfg.device == "cuda" else "cpu"
+            if cfg.posterize_levels:
+                rgb = _posterize(rgb, cfg.posterize_levels)
+            if alpha_mask is not None:
+                opaque_mask3 = (alpha_mask > 0)[:, :, None].astype(np.uint8)
+                substrate = np.full_like(rgb, 40)
+                target_np = np.where(opaque_mask3 > 0, rgb, substrate)
+            else:
+                target_np = rgb
+            target = torch.from_numpy(target_np).to(device)
+            alpha_t = None
+            alpha_mask_f = None
+            if alpha_mask is not None:
+                alpha_t = torch.from_numpy(alpha_mask).to(device)
+                alpha_mask_f = alpha_t.to(DTYPE) / 255.0
+            edge_weight = (_edge_weight_map(target, cfg.edge_strength)
+                            if cfg.edge_strength > 0 else None)
+            # canvas_init is the mean of the target (or substrate-40 for
+            # sticker) — same construction as engine.py:566-570.
+            if alpha_mask is not None:
+                canvas_init = torch.full(
+                    (canvas_h, canvas_w, 3), 40,
+                    dtype=torch.uint8, device=device,
+                )
+            else:
+                mean = target.to(DTYPE).reshape(-1, 3).mean(dim=0).round() \
+                    .clamp(0, 255).to(torch.uint8)
+                canvas_init = mean.view(1, 1, 3) \
+                    .expand(canvas_h, canvas_w, 3).contiguous().clone()
+    except Exception as exc:  # pragma: no cover — defensive
+        emit(stream, {
+            "kind": "error", "stage": "build_polish_inputs",
+            "message": f"{type(exc).__name__}: {exc}",
+        })
+        return 1
+
+    steps = cfg.polish_steps_override if cfg.polish_steps_override is not None else 150
+    emit(stream, {"kind": "progress", "shape_count": 0, "total": steps})
+
+    try:
+        with logger.start_phase("joint_polish",
+                                  steps=steps,
+                                  shape_count=len(shapes_json)):
+            refined, _canvas_np = joint_polish(
+                shapes_json, target, alpha_t, alpha_mask_f, edge_weight,
+                canvas_init, canvas_h, canvas_w, steps,
+                lock_alpha=cfg.lock_alpha,
+                purity_penalty=0.0,
+                freeze_geometry=True,
+            )
+            logger.log("joint_polish_done", refined_count=len(refined))
+    except RuntimeError as exc:
+        # joint_polish + OOM are converted to RuntimeError upstream;
+        # surface verbatim like the fresh path.
+        emit(stream, {
+            "kind": "error", "stage": "joint_polish",
+            "message": f"{type(exc).__name__}: {exc}",
+        })
+        return 1
+    except Exception as exc:  # pragma: no cover — defensive
+        emit(stream, {
+            "kind": "error", "stage": "joint_polish",
+            "message": f"{type(exc).__name__}: {exc}",
+        })
+        return 1
+
+    # Save via the canonical exporter so the validator hook (#100) runs.
+    try:
+        with logger.start_phase("save_json",
+                                  output_path=str(cfg.output_json_path)):
+            polished_doc = FD6Document(
+                source_image=cfg.image_path.name,
+                image_size=(canvas_w, canvas_h),
+                shape_count=len(refined),
+                generated_at=doc.generated_at,
+                profile=f"{doc.profile} (polished)" if doc.profile else "polished",
+                sticker_mode=sticker,
+                shapes=refined,
+            )
+            save_json(polished_doc, cfg.output_json_path)
+    except (OSError, ValueError, KeyError) as exc:
+        emit(stream, {
+            "kind": "error", "stage": "save_json",
+            "message": f"{type(exc).__name__}: {exc}",
+        })
+        return 1
+
+    logger.log("polish_only_done",
+               output_path=str(cfg.output_json_path),
+               shape_count=len(refined))
+    emit(stream, {
+        "kind": "done",
+        "output_path": str(cfg.output_json_path),
+        "shape_count": len(refined),
+    })
+    return 0
+
+
 def run(cfg: RunConfig, stream=sys.stderr) -> int:
     """Execute the configured run. Returns exit code."""
     # Subprocess gets its own log session file (process_label='runner')
@@ -405,6 +627,11 @@ def run(cfg: RunConfig, stream=sys.stderr) -> int:
                 return nullcontext()
         logger = _NoopLogger()
     emit(stream, {"kind": "started", "cfg_summary": cfg.summary()})
+
+    # Mode dispatch (#85 #86). polish_only branches off here; fresh
+    # continues with the historic path below.
+    if cfg.mode == "polish_only":
+        return _run_polish_only(cfg, stream, logger)
 
     # Lazy-import the engine so a bad config (caught in main()) doesn't
     # need torch to be installed first. Also lets us emit a clean
