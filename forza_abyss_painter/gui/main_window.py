@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread
@@ -96,6 +97,8 @@ class MainWindow(QMainWindow):
         # Wire signals — Forza paths (unchanged)
         self.upload.files_selected.connect(self._on_files_selected)
         self.upload.json_loaded.connect(self._on_json_loaded_for_preview)
+        self.upload.reshape_requested.connect(self._on_reshape_requested)
+        self.upload.polish_requested.connect(self._on_polish_requested)
         self.upload.download_json_requested.connect(self._on_download_json)
         self.settings_panel.start_clicked.connect(self._start_next)
         self.settings_panel.pause_clicked.connect(self._toggle_pause)
@@ -1276,6 +1279,152 @@ class MainWindow(QMainWindow):
         if json_path:
             self._on_inject_json_path(Path(json_path))
 
+    def _prompt_source_image_picker(self, hint_filename: str) -> Path | None:
+        """Fallback file picker when the sibling source image is missing.
+        Returns the user-picked path or None on cancel."""
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        QMessageBox.information(
+            self, "Source image not found",
+            f"The loaded JSON refers to source image '{hint_filename}', "
+            f"but no file with that name exists next to the JSON. "
+            f"Pick the source image manually.",
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Pick source image (looking for '{hint_filename}')",
+            "", "Images (*.png *.jpg *.jpeg *.webp);;All files (*)",
+        )
+        return Path(path) if path else None
+
+    def _resolve_source_for_loaded_json(self, json_path: Path) -> Path | None:
+        """Resolve the source image for a loaded JSON. Returns None when
+        the user cancels the picker fallback — caller aborts silently."""
+        from forza_abyss_painter.io.exporter import load_json
+        try:
+            doc = load_json(str(json_path))
+        except Exception:
+            # Validator already gated us on load; getting here means the
+            # file changed between load and this call. Treat as fatal.
+            return None
+        sibling = _resolve_source_image_path(json_path, doc.source_image)
+        if sibling is not None:
+            return sibling
+        return self._prompt_source_image_picker(doc.source_image or "<unknown>")
+
+    def _on_reshape_requested(self, json_path: Path) -> None:
+        """#85 — user clicked Re-shape-gen at higher budget. Resolve the
+        source image, then open the existing GenerateLocallyDialog
+        pre-populated with that source."""
+        source = self._resolve_source_for_loaded_json(json_path)
+        if source is None:
+            return
+        from forza_abyss_painter.gui.generate_dialog import GenerateLocallyDialog
+        from forza_abyss_painter.gui.runtime_install_dialog import (
+            prompt_install_or_use_existing,
+        )
+        if not prompt_install_or_use_existing(self):
+            return
+        dlg = GenerateLocallyDialog(self, initial_source_path=source)
+        if dlg.exec() == dlg.Accepted and dlg.output_path:
+            self._on_json_loaded_for_preview(dlg.output_path)
+
+    def _on_polish_requested(self, json_path: Path) -> None:
+        """#86 — user clicked Polish loaded JSON. Resolve the source
+        image, open PolishDialog, on accept spawn GpuGenWorker with the
+        polish config."""
+        from PySide6.QtCore import QThread
+        from PySide6.QtWidgets import QMessageBox
+        source = self._resolve_source_for_loaded_json(json_path)
+        if source is None:
+            return
+        from forza_abyss_painter.gui.polish_dialog import PolishDialog
+        from forza_abyss_painter.gui.gpu_gen_worker import (
+            GpuGenWorker, build_polish_config,
+        )
+        from forza_abyss_painter.gui.runtime_install_dialog import (
+            prompt_install_or_use_existing,
+        )
+        from forza_abyss_painter.runtime.torch_installer import embedded_python_exe
+        if not prompt_install_or_use_existing(self):
+            return
+        dlg = PolishDialog(self,
+                            loaded_json_path=json_path,
+                            source_image_path=source)
+        if dlg.exec() != dlg.Accepted:
+            return
+        values = dlg.values()
+
+        # Detect sticker mode from the source image's transparency, same
+        # as the renderer does. If the user set the sticker checkbox, that
+        # also flips this on (matches fresh-gen ergonomics).
+        sticker = bool(getattr(self.settings_panel, "sticker_mode_cb", None) and
+                        not self.settings_panel.sticker_mode_cb.isChecked())
+
+        config = build_polish_config(
+            source_image_path=source,
+            input_shapes_path=json_path,
+            output_path=values["output_path"],
+            steps=values["steps"],
+            lock_alpha=values["lock_alpha"],
+            sticker_mode=sticker,
+        )
+        config_path = json_path.parent / f".{json_path.stem}_polish_config.json"
+        try:
+            config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(self, "Couldn't start polish",
+                                  f"Failed to write polish config: {exc}")
+            return
+        py = embedded_python_exe()
+        if not py.exists():
+            QMessageBox.critical(
+                self, "GPU runtime missing",
+                f"Embedded Python not found at {py}. "
+                f"Open Tools → Generate shapes locally to install the runtime.",
+            )
+            return
+
+        # Spawn the worker on a QThread — same pattern GenerateLocallyDialog uses.
+        self._polish_thread = QThread(self)
+        self._polish_worker = GpuGenWorker(
+            embedded_python_exe=py,
+            config_path=config_path,
+        )
+        self._polish_worker.moveToThread(self._polish_thread)
+        self._polish_thread.started.connect(self._polish_worker.run)
+        self._polish_worker.started.connect(self._on_polish_started)
+        self._polish_worker.progress.connect(self._on_polish_progress)
+        self._polish_worker.checkpoint.connect(self._on_polish_progress)
+        self._polish_worker.done.connect(self._on_polish_done)
+        self._polish_worker.error.connect(self._on_polish_error)
+        self._polish_worker.finished.connect(self._polish_thread.quit)
+        self._polish_worker.finished.connect(self._polish_worker.deleteLater)
+        self._polish_thread.finished.connect(self._polish_thread.deleteLater)
+        self.statusBar().showMessage("Polishing — running optimizer on GPU…")
+        self._polish_thread.start()
+
+    def _on_polish_started(self, summary: dict) -> None:
+        self.statusBar().showMessage("Polish started — running joint_polish on GPU…")
+
+    def _on_polish_progress(self, current: int, total: int) -> None:
+        if total > 0:
+            self.statusBar().showMessage(f"Polish — step {current}/{total}")
+
+    def _on_polish_done(self, output_path: str, shape_count: int) -> None:
+        from pathlib import Path as _Path
+        path = _Path(output_path)
+        self.statusBar().showMessage(
+            f"Polish done — {shape_count} shapes saved to {path.name}", 10000,
+        )
+        # Auto-load the polished JSON into the preview so the user can
+        # compare visually + click Inject when ready.
+        self._on_json_loaded_for_preview(path)
+
+    def _on_polish_error(self, stage: str, message: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.critical(self, f"Polish failed — {stage}",
+                              f"Stage: {stage}\n\n{message}")
+        self.statusBar().showMessage(f"Polish failed at {stage}.", 10000)
+
     def _on_json_loaded_for_preview(self, json_path: Path) -> None:
         """User clicked Upload JSON -> load the file, render shapes onto the preview pane.
         Does NOT inject. User must click Inject into FH6 after to actually push to game.
@@ -1296,6 +1445,7 @@ class MainWindow(QMainWindow):
             shapes = doc.materialize_shapes()
         except Exception as exc:
             QMessageBox.critical(self, "Load failed", f"{type(exc).__name__}: {exc}")
+            self.upload.set_json_loaded(None)
             return
 
         # Validate the normalized document (legacy JSONs have already been
@@ -1314,6 +1464,7 @@ class MainWindow(QMainWindow):
                 f"Load aborted — {len(errors)} validation error(s) in {json_path.name}",
                 8000,
             )
+            self.upload.set_json_loaded(None)
             return
         # Cache the issues + path so the Tools menu can re-show them
         # without re-loading the file. Status-bar one-liner if there's
@@ -1342,6 +1493,7 @@ class MainWindow(QMainWindow):
         )
         self.preview.progress.setValue(100)
         self._loaded_json_path = json_path
+        self.upload.set_json_loaded(json_path)
         # Enable Tools → Validate current JSON now that we have something
         # to validate. Stays enabled across subsequent loads.
         if hasattr(self, "_validate_act"):
