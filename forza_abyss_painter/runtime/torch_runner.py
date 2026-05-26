@@ -113,33 +113,95 @@ class RunConfig:
     # Used by the EXE's status bar / progress label.
     preset_label: str = ""
 
+    # --- Mode dispatch (#85 #86) ---------------------------------------
+    # mode == "fresh"        → generate shapes from image (the default,
+    #                          unchanged historic behavior)
+    # mode == "polish_only"  → load shapes from input_shapes_path + run
+    #                          joint_polish() on them with the supplied
+    #                          image as target. num_shapes, max_resolution,
+    #                          random_samples are not required in this
+    #                          mode (canvas size comes from the loaded
+    #                          doc.image_size).
+    mode: str = "fresh"
+    input_shapes_path: Path | None = None
+    polish_steps_override: int | None = None
+
     @classmethod
     def from_dict(cls, d: dict) -> "RunConfig":
         """Parse + validate. Raises ValueError on missing required fields,
-        wrong types, or out-of-range values."""
-        # Required fields.
+        wrong types, or out-of-range values. Conditional requirements
+        depend on `mode`:
+
+          mode='fresh' (default)  — image_path, output_json_path,
+              num_shapes, max_resolution, random_samples are all required.
+          mode='polish_only'       — image_path, output_json_path,
+              input_shapes_path are required. The shape-budget fields are
+              ignored (canvas dims come from the loaded JSON's image_size).
+        """
+        mode = str(d.get("mode", "fresh"))
+        if mode not in ("fresh", "polish_only"):
+            raise ValueError(
+                f"unknown mode {mode!r} — must be 'fresh' or 'polish_only'"
+            )
+
+        # Always-required fields, regardless of mode.
         try:
             image_path = Path(d["image_path"])
             output_json_path = Path(d["output_json_path"])
-            num_shapes = int(d["num_shapes"])
-            max_resolution = int(d["max_resolution"])
-            random_samples = int(d["random_samples"])
         except KeyError as exc:
             raise ValueError(f"missing required config field: {exc}") from exc
-        # Range checks — silent garbage values would only manifest as
-        # deep-engine errors that are confusing to triage.
-        if num_shapes < 1:
-            raise ValueError(f"num_shapes must be >= 1, got {num_shapes}")
-        if max_resolution < 64:
-            raise ValueError(f"max_resolution must be >= 64, got {max_resolution}")
-        if random_samples < 1:
-            raise ValueError(f"random_samples must be >= 1, got {random_samples}")
-        # Optional with type coercion.
+
+        if mode == "polish_only":
+            # polish_only fields.
+            isp = d.get("input_shapes_path")
+            if not isp:
+                raise ValueError(
+                    "input_shapes_path is required when mode='polish_only'"
+                )
+            input_shapes_path = Path(isp)
+            if not input_shapes_path.is_file():
+                raise ValueError(
+                    f"input_shapes_path not found: {input_shapes_path}"
+                )
+            polish_steps_override = d.get("polish_steps_override")
+            if polish_steps_override is not None:
+                polish_steps_override = int(polish_steps_override)
+                if polish_steps_override < 1:
+                    raise ValueError(
+                        f"polish_steps_override must be >= 1, "
+                        f"got {polish_steps_override}"
+                    )
+            num_shapes = 0
+            max_resolution = 0
+            random_samples = 0
+        else:
+            # Fresh-mode required fields.
+            try:
+                num_shapes = int(d["num_shapes"])
+                max_resolution = int(d["max_resolution"])
+                random_samples = int(d["random_samples"])
+            except KeyError as exc:
+                raise ValueError(
+                    f"missing required config field: {exc}"
+                ) from exc
+            if num_shapes < 1:
+                raise ValueError(
+                    f"num_shapes must be >= 1, got {num_shapes}"
+                )
+            if max_resolution < 64:
+                raise ValueError(
+                    f"max_resolution must be >= 64, got {max_resolution}"
+                )
+            if random_samples < 1:
+                raise ValueError(
+                    f"random_samples must be >= 1, got {random_samples}"
+                )
+            input_shapes_path = None
+            polish_steps_override = None
+
+        # Optional with type coercion (same across modes).
         lock_alpha = bool(d.get("lock_alpha", True))
         if not lock_alpha:
-            # Hard system constraint — see GPUConfig.lock_alpha docstring.
-            # Surface the violation EARLY so the EXE doesn't waste minutes
-            # running a shape-gen whose output the injector would reject.
             raise ValueError(
                 "lock_alpha=False is not a supported value — the Forza "
                 "injector writes alpha=255 at inject time and any non-opaque "
@@ -166,6 +228,9 @@ class RunConfig:
             checkpoint_every=int(d.get("checkpoint_every", 0)),
             device=device,
             preset_label=str(d.get("preset_label", "")),
+            mode=mode,
+            input_shapes_path=input_shapes_path,
+            polish_steps_override=polish_steps_override,
         )
 
     def summary(self) -> dict:
