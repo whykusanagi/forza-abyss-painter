@@ -103,6 +103,10 @@ class MainWindow(QMainWindow):
         self._current_profile: Profile | None = None
         self._last_finished_json: Path | None = None  # tracks most recent completed run for Download button
         self._loaded_json_path: Path | None = None    # JSON loaded via Upload JSON (ready to inject)
+        # Cached validation issues from the last auto-validate on Upload
+        # JSON. Re-shown by Tools → Validate current JSON without
+        # re-reading the file. None until the first successful load.
+        self._loaded_json_issues: list | None = None
         self._inject_worker = None  # InjectionWorker (set when injecting)
         self._inject_thread: QThread | None = None
 
@@ -288,6 +292,21 @@ class MainWindow(QMainWindow):
         )
         clean_act.triggered.connect(self._on_clean_json)
         tools_menu.addAction(clean_act)
+
+        # Validate currently-loaded JSON against fd6.shapes v1 spec.
+        # Surfaces issues that would silently break the inject — bad
+        # extents, non-injector-safe shape types, invisible (alpha=0)
+        # shapes without is_mask=true. Re-runs validation even if the
+        # JSON was already auto-validated at load time, so users can
+        # check after a hand-edit. Disabled until a JSON is loaded.
+        self._validate_act = QAction("&Validate current JSON…", self)
+        self._validate_act.setStatusTip(
+            "Run fd6.shapes v1 schema validation on the currently-loaded "
+            "JSON and show every finding (errors, warnings, info)"
+        )
+        self._validate_act.triggered.connect(self._on_validate_current_json)
+        self._validate_act.setEnabled(False)   # nothing loaded yet
+        tools_menu.addAction(self._validate_act)
 
         # Save diagnostics bundle: zip the GPU logs + runtime marker +
         # system info so testers can email a single attachment when
@@ -730,6 +749,56 @@ class MainWindow(QMainWindow):
                 f"Generated {out.name} — ready to inject.", 8000,
             )
 
+    def _on_validate_current_json(self) -> None:
+        """Tools menu → Validate current JSON. Re-runs validation on
+        the JSON loaded via Upload JSON and shows every finding in a
+        scrollable modal. If the user hasn't loaded a JSON yet, shows
+        a hint instead of the dialog (the menu action is supposed to
+        be disabled in that state, but defensive guard).
+
+        Re-reads the file from disk rather than using the cached issue
+        list — that way users get fresh validation after a hand-edit
+        without having to Upload JSON again."""
+        from forza_abyss_painter.gui.validation_dialog import show_validation_dialog
+        if not self._loaded_json_path or not self._loaded_json_path.exists():
+            QMessageBox.information(
+                self, "Validate JSON",
+                "Load a JSON via Upload JSON first, then re-run this "
+                "to see schema findings.",
+            )
+            return
+        # Re-read + re-validate from disk. Pulls in any external edits.
+        import json
+        from forza_abyss_painter.io.json_schema import FD6Document
+        from forza_abyss_painter.io.validator import validate_document
+        try:
+            raw = json.loads(self._loaded_json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            QMessageBox.critical(
+                self, "Re-validate failed",
+                f"Could not re-read {self._loaded_json_path.name}: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return
+        # Run through FD6Document.from_dict so legacy JSONs get
+        # normalized to v1 before validation — same path as load_json.
+        try:
+            doc = FD6Document.from_dict(raw)
+            issues = validate_document(doc.to_dict())
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Re-validate failed",
+                f"Could not normalize document: {type(exc).__name__}: {exc}",
+            )
+            return
+        # Update the cache so subsequent inject-time reads see the
+        # fresh findings too.
+        self._loaded_json_issues = issues
+        show_validation_dialog(
+            self, issues,
+            title=f"Validation: {self._loaded_json_path.name}",
+        )
+
     def _on_save_diagnostics(self) -> None:
         """Tools menu → Save diagnostics zip. Opens a file picker for
         the output path, calls the diagnostics-bundle library, then
@@ -1115,15 +1184,51 @@ class MainWindow(QMainWindow):
     def _on_json_loaded_for_preview(self, json_path: Path) -> None:
         """User clicked Upload JSON -> load the file, render shapes onto the preview pane.
         Does NOT inject. User must click Inject into FH6 after to actually push to game.
+
+        Auto-validates the loaded JSON against fd6.shapes v1 schema. ERROR-severity
+        findings block the preview (the JSON wouldn't inject anyway); WARNINGs flow
+        through to a status-bar message + the cached issue list (re-viewable via
+        Tools → Validate current JSON). See #100 / docs/JSON_SPEC.md.
         """
         from forza_abyss_painter.io.exporter import load_json
+        from forza_abyss_painter.io.validator import Severity, validate_document
         from forza_abyss_painter.shapegen.render import render_shapes
+        from forza_abyss_painter.gui.validation_dialog import (
+            show_validation_dialog, summarize_for_status_bar,
+        )
         try:
             doc = load_json(str(json_path))
             shapes = doc.materialize_shapes()
         except Exception as exc:
             QMessageBox.critical(self, "Load failed", f"{type(exc).__name__}: {exc}")
             return
+
+        # Validate the normalized document (legacy JSONs have already been
+        # converted to native v1 by load_json → FD6Document.from_dict).
+        validation_issues = validate_document(doc.to_dict())
+        errors = [i for i in validation_issues if i.severity is Severity.ERROR]
+        if errors:
+            # Surface ALL findings (not just errors) so the user sees full
+            # context — but block the preview render because a broken JSON
+            # would either crash the renderer or paint nonsense.
+            show_validation_dialog(
+                self, validation_issues,
+                title=f"Cannot load: {json_path.name} has validation errors",
+            )
+            self.statusBar().showMessage(
+                f"Load aborted — {len(errors)} validation error(s) in {json_path.name}",
+                8000,
+            )
+            return
+        # Cache the issues + path so the Tools menu can re-show them
+        # without re-loading the file. Status-bar one-liner if there's
+        # anything worth mentioning (warnings); silent on clean.
+        self._loaded_json_issues = validation_issues
+        summary = summarize_for_status_bar(validation_issues)
+        if summary:
+            self.statusBar().showMessage(
+                f"{summary} — review via Tools → Validate current JSON", 6000,
+            )
         w, h = doc.image_size if doc.image_size and doc.image_size[0] > 0 else (1200, 800)
         self.statusBar().showMessage(f"Rendering preview of {len(shapes)} shapes from {json_path.name}...")
         # Render with transparent backdrop when EITHER:
@@ -1142,6 +1247,10 @@ class MainWindow(QMainWindow):
         )
         self.preview.progress.setValue(100)
         self._loaded_json_path = json_path
+        # Enable Tools → Validate current JSON now that we have something
+        # to validate. Stays enabled across subsequent loads.
+        if hasattr(self, "_validate_act"):
+            self._validate_act.setEnabled(True)
         self.statusBar().showMessage(
             f"Preview ready. Click 'Inject into FH6' to push these shapes into the game.", 8000
         )
