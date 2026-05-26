@@ -192,3 +192,42 @@ This wipes the entire embedded Python + torch tree. Logs are
 preserved separately under `\logs\` so you don't lose diagnostic
 history. Re-open the EXE and re-run **Install GPU runtime…** — it'll
 start from scratch.
+
+## Refresh the bundled package code after an EXE upgrade
+
+The runtime install keeps its OWN copy of `forza_abyss_painter/{shapegen,
+io,runtime,cli}` under
+`%LOCALAPPDATA%\ForzaAbyssPainter\runtime\python311\Lib\site-packages\`.
+That copy is laid down ONCE at install time and is not updated when
+you upgrade the EXE — so a freshly-rebuilt EXE with bug fixes ships
+new code, but the embedded subprocess runner still executes the OLD
+code from the first install. Symptom: "I upgraded but nothing
+changed."
+
+`fap-refresh` re-copies just those subpackages without redoing the
+multi-GiB torch download:
+
+```powershell
+# Inspect the embedded snapshot's current state
+"$env:LOCALAPPDATA\ForzaAbyssPainter\runtime\python311\python.exe" `
+  -m forza_abyss_painter.cli.refresh --verify-only
+
+# Dry-run: list what would be copied
+"$env:LOCALAPPDATA\ForzaAbyssPainter\runtime\python311\python.exe" `
+  -m forza_abyss_painter.cli.refresh --dry-run
+
+# Actually refresh (~5 seconds)
+"$env:LOCALAPPDATA\ForzaAbyssPainter\runtime\python311\python.exe" `
+  -m forza_abyss_painter.cli.refresh
+```
+
+Or, if you installed the dev package, the entry point on PATH:
+
+```powershell
+fap-refresh
+fap-refresh --verify-only
+fap-refresh --dry-run
+```
+
+Returns exit 2 if the runtime isn't installed yet (run **Install GPU
+runtime…** first — refresh isn't a substitute for the initial install).

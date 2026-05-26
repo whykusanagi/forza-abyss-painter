@@ -485,6 +485,28 @@ def _run_gpu_inner(
     use_bbox = (cfg.bbox_local and cfg.refine_mode == "gradient"
                 and len(kinds) == 1 and kinds[0].name == "rotated_ellipse")
 
+    # Loud warning when we're about to take the full_canvas path with
+    # a K large enough to OOM rasterize_hard. Cursor's QUASAR step-
+    # trace caught this on a 32 GiB card: K=8192 + 720px → (K, H, W)
+    # float32 = ~16 GiB monolithic alloc inside rasterize_hard, BEFORE
+    # the chunked scorer even runs. Chunking is only wired for scoring
+    # (not for the up-front rasterize) so the user's vram_budget can't
+    # save them. Strategy-B chunked rasterize is #129; until that
+    # lands, this warning is the canary.
+    if not use_bbox and cfg.random_samples > 1024:
+        import sys as _sys
+        print(
+            f"[WARN] use_bbox=False with K={cfg.random_samples} — "
+            f"engine will allocate a (K, {h}, {w}) ≈ "
+            f"{cfg.random_samples * h * w * 4 / 1e9:.1f} GiB mask "
+            f"tensor inside rasterize_hard BEFORE chunked scoring "
+            f"engages. This OOMs on consumer GPUs. Set bbox_local=True "
+            f"for ellipse-only runs (the EXE production path), or drop "
+            f"random_samples ≤ 1024 for full_canvas. Chunked rasterize "
+            f"is the proper fix (#129) but not yet wired.",
+            file=_sys.stderr, flush=True,
+        )
+
     # Resolve the chunked-K mini-batch size ONCE up front. Used by every
     # call to crop_score_ellipse_batch_chunked / score_batch_chunked
     # below. 0 = no chunking (full K-batch in one pass, original

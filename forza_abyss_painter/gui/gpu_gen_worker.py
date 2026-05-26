@@ -408,4 +408,14 @@ def build_run_config(
         # the full K in one pass (original behavior). Trade wall time
         # linearly for peak VRAM.
         "vram_budget_gib": float(vram_budget_gib),
+        # Force the bbox-local code path for the EXE. The full_canvas
+        # branch materializes (K, H, W) masks in rasterize_hard BEFORE
+        # scoring kicks in — at K=8192 + 720px that's 16 GiB monolithic
+        # and OOMs even with chunked scoring. bbox-local uses
+        # crop_score_ellipse_batch_chunked which never allocates the
+        # full (K, H, W) tensor. Cursor's QUASAR step-trace confirmed
+        # bbox-local peaks at ~3.66 GiB per chunk on the same workload
+        # that OOMs full_canvas at 47.5 GiB. Until strategy-B chunked
+        # rasterize lands (#129), this is the only safe path.
+        "bbox_local": True,
     }

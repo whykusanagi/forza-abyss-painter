@@ -32,7 +32,13 @@ Optional fields with defaults that mirror GPUConfig defaults:
     seed                int (default 0 = time-based)
     edge_strength       float (default 0.0)
     posterize_levels    int (default 0)
-    bbox_local          bool (default False)
+    bbox_local          bool (default True — production EXE path; the
+                        full_canvas path materializes (K, H, W) masks
+                        in one shot inside rasterize_hard which OOMs
+                        at K=8192 + 720px on 32 GiB cards; chunking is
+                        only wired for scoring, not rasterize. Set to
+                        False ONLY for multi-shape / non-ellipse runs
+                        once strategy-B chunked-rasterize lands.)
     joint_polish_steps  int (default 0)
     lock_alpha          bool (default True; raising False is rejected)
     progress_every      int (default 0 — no progress events)
@@ -93,7 +99,7 @@ class RunConfig:
     seed: int = 0
     edge_strength: float = 0.0
     posterize_levels: int = 0
-    bbox_local: bool = False
+    bbox_local: bool = True   # production EXE default; see field doc
     joint_polish_steps: int = 0
     lock_alpha: bool = True
     progress_every: int = 0
@@ -152,7 +158,7 @@ class RunConfig:
             seed=int(d.get("seed", 0)),
             edge_strength=float(d.get("edge_strength", 0.0)),
             posterize_levels=int(d.get("posterize_levels", 0)),
-            bbox_local=bool(d.get("bbox_local", False)),
+            bbox_local=bool(d.get("bbox_local", True)),
             joint_polish_steps=int(d.get("joint_polish_steps", 0)),
             vram_budget_gib=float(d.get("vram_budget_gib", 0.0)),
             lock_alpha=lock_alpha,
