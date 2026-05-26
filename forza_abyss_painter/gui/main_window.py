@@ -23,6 +23,21 @@ from forza_abyss_painter.inject.fh6_injector import patterns_are_populated, FH6_
 from forza_abyss_painter.suite import SuiteMode, SUITE_DISPLAY, saved_suite_mode, save_suite_mode
 
 
+def _resolve_source_image_path(json_path: Path, source_image_name: str) -> Path | None:
+    """Resolve the source image for a loaded JSON via the same-folder
+    heuristic. `source_image_name` is the JSON's `source_image` field
+    (canonically a bare filename); if it accidentally contains path
+    separators we use only the basename for safety. Returns the path
+    if the sibling exists, otherwise None — caller falls back to a
+    file picker.
+    """
+    if not source_image_name:
+        return None
+    bare = Path(source_image_name).name   # strip any embedded path
+    candidate = json_path.parent / bare
+    return candidate if candidate.is_file() else None
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
