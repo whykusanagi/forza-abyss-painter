@@ -396,7 +396,7 @@ def _run_polish_only(cfg: RunConfig, stream, logger) -> int:
     # applies if torch isn't installed.
     try:
         with logger.start_phase("import_engine"):
-            import torch  # noqa: F401
+            import torch
             import numpy as np
             from forza_abyss_painter.shapegen.gpu.joint_polish import joint_polish
             from forza_abyss_painter.shapegen.gpu.engine import (
@@ -535,6 +535,7 @@ def _run_polish_only(cfg: RunConfig, stream, logger) -> int:
                 canvas_init = mean.view(1, 1, 3) \
                     .expand(canvas_h, canvas_w, 3).contiguous().clone()
     except Exception as exc:  # pragma: no cover — defensive
+        logger.log_exception("build_polish_inputs_unexpected", exc)
         emit(stream, {
             "kind": "error", "stage": "build_polish_inputs",
             "message": f"{type(exc).__name__}: {exc}",
@@ -565,6 +566,7 @@ def _run_polish_only(cfg: RunConfig, stream, logger) -> int:
         })
         return 1
     except Exception as exc:  # pragma: no cover — defensive
+        logger.log_exception("joint_polish_unexpected", exc)
         emit(stream, {
             "kind": "error", "stage": "joint_polish",
             "message": f"{type(exc).__name__}: {exc}",
