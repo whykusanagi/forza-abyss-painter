@@ -26,10 +26,12 @@ GPU_PHASE_3_AVAILABLE: bool = True
 # detects a JSON is loaded. Plumbing: upload_panel button + signal,
 # main_window slot, GenerateLocallyDialog accepts initial_source_path.
 # Flip True in the same commit that lands smoke-tested plumbing.
-RESHAPE_GEN_AVAILABLE: bool = False
+# Flipped to True 2026-05-26 — plumbing landed in Tier B PR.
+RESHAPE_GEN_AVAILABLE: bool = True
 
 # Polish a loaded JSON via joint_polish (#86). Adds a new mode
 # ("polish_only") to torch_runner.RunConfig. PolishDialog exposes
 # polish iterations + lock_alpha. Output is <input>_polished.json.
 # Flip True in the same commit that lands smoke-tested plumbing.
-POLISH_LOADED_AVAILABLE: bool = False
+# Flipped to True 2026-05-26 — plumbing landed in Tier B PR.
+POLISH_LOADED_AVAILABLE: bool = True
