@@ -1,5 +1,43 @@
 # GPU runtime install — what to expect, what NOT to do
 
+## Reference timings — how long should a run actually take?
+
+These are **ballpark expectations**, not benchmarks. Use them to
+sanity-check "is my run going slower than it should?" The biggest
+factor is your card's VRAM bandwidth + sm count; the second biggest is
+whether chunked-K kicks in (it adds a linear multiplier).
+
+| GPU class | Per-shape (single-chunk) | 1000 shapes | 3000 shapes |
+|---|---|---|---|
+| Intel iGPU / GTX 1060 | ~500 ms | ~8 min | ~25 min |
+| RTX 2060 / 3050 (8 GB) | ~200–300 ms | 3–5 min | 10–15 min |
+| RTX 3060 / 4060 (12 GB) | ~100–150 ms | 2–3 min | 5–8 min |
+| RTX 3070 / 3080 / 4070 (10–12 GB) | ~50–100 ms | 1–2 min | 3–5 min |
+| RTX 4080 / 4090 (16–24 GB) | ~30–60 ms | <1 min | 2–3 min |
+| RTX 5080 / 5090 (16–32 GB) | ~25–50 ms | <1 min | 1.5–2.5 min |
+
+**Chunked-K multiplier:** if your VRAM budget forces chunking, multiply
+the times above by the chunk count shown in the Start-confirm modal.
+A 12 GiB budget + 16384 random_samples + 1200 max_resolution → 4 chunks
+→ ~4× the single-chunk time.
+
+**Compared to painter-fh6's bundled OpenCL tool:** they bench ~435 ms/
+ellipse on an Intel i5-12500H iGPU and ~340 ms/ellipse on AMD AIMAX395.
+Our pipeline does more work per shape (gradient refinement + joint
+polish) so per-shape times are similar on weak hardware but pulls ahead
+on Ampere/Ada/Blackwell because the gradient pass parallelizes better
+on tensor cores.
+
+If your real-world numbers come in **3× higher** than the table on a
+matching GPU class, something's wrong — most often that's other apps
+(FH6, Discord, browser) sharing VRAM and forcing chunking you didn't
+expect. Check the status bar's chunk-count text, then either close
+other GPU apps or raise the VRAM budget tier.
+
+---
+
+
+
 A guide for testers and end users on first installing the local GPU
 shape-gen runtime via **Tools → Install GPU runtime…** (or by picking
 "GPU" from the *Generate using* dropdown in Settings).

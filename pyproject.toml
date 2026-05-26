@@ -19,6 +19,7 @@ dependencies = [
 forza-abyss-painter = "forza_abyss_painter.app:main"
 fap-clean = "forza_abyss_painter.cli.clean:main"
 fap-diag = "forza_abyss_painter.runtime.diagnostics:main"
+fap-generate = "forza_abyss_painter.cli.generate:main"
 
 [tool.setuptools.packages.find]
 include = ["forza_abyss_painter*"]
