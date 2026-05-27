@@ -23,6 +23,7 @@ class UploadPanel(QWidget):
     download_json_requested = Signal()   # User wants to save the most-recent generated JSON
     reshape_requested = Signal(Path)     # User wants to re-shape-gen using the loaded JSON's source image
     polish_requested = Signal(Path)      # User wants to polish the loaded JSON in place
+    resume_requested = Signal(Path)      # User picked a snapshot to resume from
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -86,6 +87,19 @@ class UploadPanel(QWidget):
         reshape_polish_row.addWidget(self.polish_btn)
         layout.addLayout(reshape_polish_row)
 
+        # Resume from snapshot (#snapshot-resume). Always visible — failed
+        # runs are a day-one concern, no flag, no gate on loaded JSON.
+        resume_row = QHBoxLayout()
+        self.resume_btn = QPushButton("Resume from snapshot…", self)
+        self.resume_btn.setToolTip(
+            "Pick a partial snapshot (<name>_<count>.json) from a "
+            "failed or cancelled run and continue generation to the "
+            "original target shape count using the original settings."
+        )
+        self.resume_btn.clicked.connect(self._on_resume_clicked)
+        resume_row.addWidget(self.resume_btn)
+        layout.addLayout(resume_row)
+
         layout.addSpacing(4)
         # Label tracks which panel is showing — flips when Customizations
         # toggle is flipped.
@@ -143,6 +157,15 @@ class UploadPanel(QWidget):
     def _on_polish_clicked(self) -> None:
         if self._loaded_json_path is not None:
             self.polish_requested.emit(self._loaded_json_path)
+
+    def _on_resume_clicked(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Pick snapshot to resume",
+            "",
+            "Forza Abyss Painter snapshots (*_*.json);;All JSON (*.json);;All files (*)",
+        )
+        if path:
+            self.resume_requested.emit(Path(path))
 
     def _on_upload_clicked(self) -> None:
         exts = " ".join(f"*{e}" for e in sorted(SUPPORTED_EXTS))
