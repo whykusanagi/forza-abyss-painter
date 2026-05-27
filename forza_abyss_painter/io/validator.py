@@ -235,7 +235,14 @@ def _check_top_level(data: dict, issues: list[Issue]) -> None:
 
     # Unknown top-level fields are explicitly allowed per the spec's
     # §Stability promise — flag them at INFO so tools can spot drift.
+    # Keys prefixed with `_` are reserved for non-spec metadata (e.g.
+    # `_run_config` written by the resume system). Validator stays out
+    # of the way entirely — no INFO, no WARNING, no ERROR.
     for key in data.keys():
+        if key.startswith("_"):
+            # Reserved for non-spec metadata (e.g. _run_config from
+            # the resume system). Validator stays out of the way.
+            continue
         if key not in _KNOWN_TOP_LEVEL_FIELDS:
             issues.append(Issue(
                 Severity.INFO, "unknown_top_level_field",

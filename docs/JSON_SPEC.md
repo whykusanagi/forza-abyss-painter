@@ -215,6 +215,23 @@ These flags are accepted on any shape type:
 | ---------- | ------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `is_mask`  | boolean | `false` | When `true`, the renderer/injector keeps this shape even if `color[3] == 0` (alpha 0). Used by boundary-mask preprocessing for transparent backdrops. |
 
+## Optional metadata fields (`_*`)
+
+Top-level keys prefixed with `_` are reserved for non-spec metadata
+written by tools that produce or consume `fd6.shapes` documents.
+Validators MUST NOT warn or error on these keys.
+
+Currently reserved:
+
+- `_run_config` — runner state, written by the GPU/CPU shape-gen
+  runner into snapshot JSONs (and final output JSONs) so partial runs
+  can be resumed with the original parameters. Shape varies by runner
+  version; consumers should treat unknown sub-keys as opaque.
+
+Future tools may add other `_*` keys (e.g. `_diag`, `_telemetry`).
+Producers SHOULD prefix any non-spec metadata with `_` to stay out
+of the validator's strict path.
+
 ## Legacy compatibility
 
 Documents WITHOUT a `format` key are heuristically detected as
