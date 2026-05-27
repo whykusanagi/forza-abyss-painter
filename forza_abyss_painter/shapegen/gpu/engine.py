@@ -359,6 +359,7 @@ def run_gpu(
     progress_every: int = 0,
     checkpoint_cb=None,
     checkpoint_every: int = 0,
+    seed_shapes: "list[dict] | None" = None,
 ) -> tuple[list[dict], np.ndarray]:
     """Public entry point — wraps `_run_gpu_inner` with CUDA OOM recovery.
 
@@ -373,12 +374,17 @@ def run_gpu(
     Critical for the consumer-GPU notebook variants where the VRAM probe
     can underestimate peak usage when FH6 is running concurrently and its
     VRAM consumption fluctuates mid-shape-gen.
+
+    If `seed_shapes` is provided, each shape is replayed onto the canvas
+    before the greedy loop, so the loop generates only
+    (cfg.num_shapes - len(seed_shapes)) new shapes.
     """
     try:
         return _run_gpu_inner(target_rgb, cfg, alpha_mask=alpha_mask,
                               progress_every=progress_every,
                               checkpoint_cb=checkpoint_cb,
-                              checkpoint_every=checkpoint_every)
+                              checkpoint_every=checkpoint_every,
+                              seed_shapes=seed_shapes)
     except torch.cuda.OutOfMemoryError as e:
         # Drop the cached allocator state so a follow-up attempt with
         # lower settings doesn't inherit this run's high-water mark.
@@ -415,6 +421,7 @@ def _run_gpu_inner(
     progress_every: int = 0,
     checkpoint_cb=None,
     checkpoint_every: int = 0,
+    seed_shapes: "list[dict] | None" = None,
 ) -> tuple[list[dict], np.ndarray]:
     """Run the GPU shape-gen loop. Returns (shapes_as_json_dicts, final_canvas_u8_numpy).
 
@@ -576,6 +583,37 @@ def _run_gpu_inner(
     consecutive_skips = 0
     shape_idx = 0
     t_start = time.perf_counter()
+
+    # Resume support (#snapshot-resume): when seed_shapes is provided,
+    # replay each onto canvas + append to the shapes list. Greedy loop
+    # then starts at len(seeded) and continues to cfg.num_shapes. The
+    # randomness state is unaffected — only the canvas + shapes list
+    # change. Polish + refill run at end as usual on the FULL set.
+    if seed_shapes:
+        ellipse_kind = KINDS["rotated_ellipse"]
+        for s in seed_shapes:
+            if s.get("type") != "rotated_ellipse":
+                # Defensive: caller should have rejected upstream
+                # (runner branch validates). If we get here, fail
+                # loud rather than corrupting canvas state.
+                raise ValueError(
+                    f"seed_shapes contains non-ellipse type "
+                    f"{s.get('type')!r}; resume currently supports "
+                    f"rotated_ellipse only"
+                )
+            params = torch.tensor(
+                [s["x"], s["y"], s["rx"], s["ry"], s["angle"]],
+                dtype=DTYPE, device=device,
+            )
+            color = torch.tensor(s["color"][:3], dtype=DTYPE, device=device)
+            alpha_val = int(s["color"][3])
+            canvas = _composite_one(
+                ellipse_kind,
+                canvas, params, color, h, w, alpha_mask_f, alpha_val,
+            )
+            shapes.append(dict(s))   # copy to avoid caller mutation
+        shape_idx = len(shapes)
+
     per_kind = max(1, cfg.random_samples // len(kinds))
     while shape_idx < cfg.num_shapes:
         # 1) Random search across all candidate kinds; keep each kind's best seed.
