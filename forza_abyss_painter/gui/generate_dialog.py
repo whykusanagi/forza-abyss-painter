@@ -31,7 +31,9 @@ from PySide6.QtWidgets import (
 )
 
 from forza_abyss_painter.gui.gpu_gen_worker import GpuGenWorker, build_run_config
+from forza_abyss_painter.runtime.nvidia_smi import probe_free_vram
 from forza_abyss_painter.runtime.torch_installer import embedded_python_exe
+from forza_abyss_painter.shapegen.gpu.vram_planner import recommend_max_resolution
 
 
 # Local-GPU preset table. Mirrors the Colab notebook lineup but with
@@ -217,18 +219,53 @@ class GenerateLocallyDialog(QDialog):
     def _on_preset_changed(self, idx: int) -> None:
         self._selected_preset_idx = idx
         preset = self.preset_combo.currentData()
-        if preset:
-            self.preset_desc.setText(
-                f"<b>{preset['label']}</b><br>"
-                f"{preset['description']}<br><br>"
-                f"<b>Settings:</b> "
-                f"max_resolution={preset['max_resolution']}, "
-                f"random_samples={preset['random_samples']}, "
-                f"estimated peak VRAM: {preset['est_peak_vram_gib']:.1f} GiB"
+        if preset is None:
+            return
+        # Probe free VRAM (#125) and compute the back-prop max_resolution
+        # recommendation (#131). The probe is cached for 5s so flipping
+        # presets doesn't spawn nvidia-smi every change.
+        probe = probe_free_vram()
+        baked_max_res = preset.get("baked_max_resolution",
+                                     preset["max_resolution"])
+        if probe.available and probe.free_gib is not None:
+            recommended = recommend_max_resolution(
+                free_gib=probe.free_gib,
+                K=int(preset["random_samples"]),
+                bbox_local=True,
             )
-            self.preset_desc.setTextFormat(Qt.RichText)
+            # Back-prop never LOWERS the baked preset value — the preset
+            # author chose that as a quality/speed default.
+            effective_max_res = max(baked_max_res, recommended)
+            rec_line = (
+                f"<br><b>Recommended max_resolution:</b> "
+                f"{effective_max_res} px "
+                f"(auto-tuned to fit {probe.free_gib:.1f} GiB free on "
+                f"{probe.name or 'GPU'}). Floor: 720."
+            )
+        else:
+            effective_max_res = baked_max_res
+            rec_line = (
+                f"<br><b>Recommended max_resolution:</b> "
+                f"{effective_max_res} px (VRAM probe unavailable; using "
+                f"safety floor)."
+            )
+
+        # Persist the effective value back into the preset dict so
+        # downstream build_run_config sees the bumped number.
+        preset.setdefault("baked_max_resolution", baked_max_res)
+        preset["max_resolution"] = effective_max_res
+
+        self.preset_desc.setText(
+            f"<b>{preset['label']}</b><br>"
+            f"{preset['description']}<br><br>"
+            f"<b>Settings:</b> "
+            f"max_resolution={preset['max_resolution']}, "
+            f"random_samples={preset['random_samples']}, "
+            f"estimated peak VRAM: {preset['est_peak_vram_gib']:.1f} GiB"
+            f"{rec_line}"
+        )
+        self.preset_desc.setTextFormat(Qt.RichText)
         self._refresh_vram_estimate()
-        # If source already picked, refresh the suggested output path.
         if self.source_path and preset:
             stem = self.source_path.stem
             suggested = (self.source_path.parent /
