@@ -125,3 +125,80 @@ def resolve_k_chunk_size(
     if k_max >= K:
         return 0   # full K fits in one pass
     return k_max
+
+
+def recommend_max_resolution(
+    free_gib: float,
+    K: int,
+    *,
+    bbox_local: bool = True,
+    bbox_crop_max: int = 256,
+    safety_floor_px: int = 720,
+    safety_margin: float = 0.85,
+    absolute_ceiling_px: int = 4096,
+) -> int:
+    """Return the largest max_resolution that fits in
+    `safety_margin * free_gib` of VRAM at the given K, in the bbox_local
+    (or full_canvas) scoring regime.
+
+    Always returns at least `safety_floor_px` (default 720). Probe-
+    unavailable callers (free_gib <= 0) get the floor. When the math
+    indicates a value above `absolute_ceiling_px` (i.e., Regime B is
+    fully satisfied), the ceiling is returned — callers separately
+    clamp by the source image's long side.
+
+    The math is documented in
+    `docs/superpowers/specs/2026-05-26-131-vram-backprop-planner-design.md`
+    §4. In short, the K-batch footprint formula has two regimes:
+
+      Regime A — crop_e = max_resolution // 8 (small canvas):
+          footprint = (2 * crop_e + 1)²       quadratic in max_res
+      Regime B — crop_e = bbox_crop_max       (big canvas, capped):
+          footprint = (2 * bbox_crop_max + 1)²   constant
+
+    Regime B is the "we're past the bbox cap; canvas size no longer
+    affects K-peak" regime — if it fits, ceiling out.
+    """
+    import math as _math
+
+    if free_gib <= 0 or K < 1:
+        return safety_floor_px
+
+    target_bytes = free_gib * safety_margin * 1e9
+    if bbox_local:
+        safety = BBOX_LOCAL_SAFETY
+    else:
+        safety = FULL_CANVAS_SAFETY
+    bytes_per_pixel = 12.0 * safety   # 3 channels × 4 bytes × safety
+
+    # Regime B check: at crop_e = bbox_crop_max, footprint is constant.
+    # If THAT fits, then any max_res >= bbox_crop_max * 8 is fine.
+    if bbox_local:
+        regime_b_footprint = (2 * bbox_crop_max + 1) ** 2
+        regime_b_total = K * regime_b_footprint * bytes_per_pixel
+        if regime_b_total <= target_bytes:
+            return int(absolute_ceiling_px)
+
+    # Regime A: footprint = (2 * (max_res // 8) + 1)². Solve for max_res.
+    # Solve: K * (2 * (m // 8) + 1)² * bytes_per_pixel <= target_bytes
+    # i.e.: (2 * (m // 8) + 1) <= sqrt(target_bytes / (K * bytes_per_pixel))
+    # i.e.: m <= 8 * ((sqrt(...) - 1) / 2)
+    if K * bytes_per_pixel <= 0:
+        return safety_floor_px
+    inner = target_bytes / (K * bytes_per_pixel)
+    if inner <= 1:
+        return safety_floor_px
+    sqrt_inner = _math.sqrt(inner)
+    if sqrt_inner <= 1:
+        return safety_floor_px
+    max_res = int(8 * (sqrt_inner - 1) / 2)
+
+    # full_canvas path uses the canvas² footprint (no bbox cap), so the
+    # solve is just: max_res² <= target_bytes / (K * bytes_per_pixel).
+    if not bbox_local:
+        max_res = int(_math.sqrt(target_bytes / (K * bytes_per_pixel)))
+
+    # Floor + ceiling clamps.
+    max_res = max(safety_floor_px, max_res)
+    max_res = min(absolute_ceiling_px, max_res)
+    return max_res
