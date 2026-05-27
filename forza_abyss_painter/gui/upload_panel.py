@@ -60,24 +60,10 @@ class UploadPanel(QWidget):
         json_row.addWidget(self.download_json_btn)
         layout.addLayout(json_row)
 
-        layout.addSpacing(4)
-        # Label tracks which panel is showing — flips when Customizations
-        # toggle is flipped.
-        self.section_label = QLabel("Recent:", self)
-        layout.addWidget(self.section_label)
-        # Stack the Recents list and Image Searcher; we swap by changing the
-        # current index from the View → Customizations menu toggle.
-        self.stack = QStackedWidget(self)
-        self.recent_list = QListWidget(self.stack)
-        self.recent_list.setObjectName("ThemeGlow")
-        self.recent_list.itemDoubleClicked.connect(self._on_recent_dbl)
-        self.stack.addWidget(self.recent_list)   # index 0 — recents
-        # image_search panel is created lazily on first toggle (see below)
-        self.image_search = None
-        layout.addWidget(self.stack, stretch=1)
-
         # Re-shape-gen + Polish (#85 #86). Both hidden until a JSON is loaded
         # AND the corresponding feature flag is True at set_json_loaded() time.
+        # IMPORTANT: placed BEFORE self.stack (stretch=1) so they are never
+        # pushed off-screen by the stack's vertical expansion.
         self._loaded_json_path: Path | None = None
         reshape_polish_row = QHBoxLayout()
         self.reshape_btn = QPushButton("Re-shape-gen at higher budget…", self)
@@ -99,6 +85,22 @@ class UploadPanel(QWidget):
         reshape_polish_row.addWidget(self.reshape_btn)
         reshape_polish_row.addWidget(self.polish_btn)
         layout.addLayout(reshape_polish_row)
+
+        layout.addSpacing(4)
+        # Label tracks which panel is showing — flips when Customizations
+        # toggle is flipped.
+        self.section_label = QLabel("Recent:", self)
+        layout.addWidget(self.section_label)
+        # Stack the Recents list and Image Searcher; we swap by changing the
+        # current index from the View → Customizations menu toggle.
+        self.stack = QStackedWidget(self)
+        self.recent_list = QListWidget(self.stack)
+        self.recent_list.setObjectName("ThemeGlow")
+        self.recent_list.itemDoubleClicked.connect(self._on_recent_dbl)
+        self.stack.addWidget(self.recent_list)   # index 0 — recents
+        # image_search panel is created lazily on first toggle (see below)
+        self.image_search = None
+        layout.addWidget(self.stack, stretch=1)
 
     def _ensure_image_search(self) -> None:
         """Construct ImageSearchPanel + Chromium renderer on first use."""
