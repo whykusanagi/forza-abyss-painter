@@ -1265,6 +1265,15 @@ class MainWindow(QMainWindow):
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
+        # Display the source image immediately so the middle panel
+        # stops sitting on "Idle". The CPU path does this around line
+        # 1068 — the GPU path used to skip it (regression).
+        self.preview.set_source(image_path)
+        # Update both the middle PreviewPanel (progress bar + status
+        # label) AND the bottom QMainWindow status bar via _on_gpu_progress
+        # (which adds the rate + ETA context).
+        self._worker.progress.connect(self.preview.on_progress)
+        self._worker.checkpoint.connect(self.preview.on_progress)
         self._worker.progress.connect(self._on_gpu_progress)
         self._worker.checkpoint.connect(self._on_gpu_progress)
         self._worker.done.connect(self._on_gpu_done)
@@ -1285,7 +1294,7 @@ class MainWindow(QMainWindow):
         # rendered a single frame.
         self.statusBar().showMessage(
             f"GPU generating: {image_path.name}{chunk_warning} — "
-            f"{autotune_message} (no live preview — final result loads when done)"
+            f"{autotune_message} (live progress in preview panel)"
         )
 
     def _on_gpu_progress(self, shape_count: int, total: int) -> None:

@@ -45,10 +45,14 @@ class PreviewPanel(QWidget):
             "minutes depending on profile (random/mutated samples) and image size."
         )
 
-    def on_progress(self, count: int, total: int, rms: float) -> None:
+    def on_progress(self, count: int, total: int, rms: float | None = None) -> None:
         pct = int(round(100 * count / max(1, total)))
         self.progress.setValue(min(100, pct))
-        self.status_label.setText(f"Shape {count}/{total}   RMS={rms:.2f}")
+        if rms is None:
+            # GPU path emits (count, total) only; CPU path includes RMS.
+            self.status_label.setText(f"Shape {count}/{total}")
+        else:
+            self.status_label.setText(f"Shape {count}/{total}   RMS={rms:.2f}")
 
     def on_preview(self, arr) -> None:
         self.preview_view.set_numpy(arr)
