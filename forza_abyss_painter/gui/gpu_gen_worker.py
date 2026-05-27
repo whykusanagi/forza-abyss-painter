@@ -386,6 +386,7 @@ def build_run_config(
     preset: dict,
     sticker_mode: bool = False,
     vram_budget_gib: float = 0.0,
+    checkpoint_every: int | None = None,
 ) -> dict:
     """Map a Generate dialog preset entry → torch_runner RunConfig dict.
 
@@ -397,6 +398,16 @@ def build_run_config(
     knobs (edge_strength, posterize, polish_steps) get added to both
     the preset table and this builder simultaneously.
     """
+    # Checkpoint cadence: caller-supplied (from GUI spinbox) preferred;
+    # otherwise fall back to the old "20 progress events per run"
+    # heuristic FLOORED at 100 (the cuda min enforced runner-side).
+    # Without the floor, callers that don't pass the kwarg (e.g.
+    # auto-queue _start_gpu path on small runs) would feed
+    # checkpoint_every=20 into a cuda runner and trip the rejection.
+    if checkpoint_every is None:
+        ce = max(100, int(preset["num_shapes"]) // 20)
+    else:
+        ce = int(checkpoint_every)
     return {
         "image_path": str(image_path),
         "output_json_path": str(output_json_path),
@@ -404,10 +415,7 @@ def build_run_config(
         "max_resolution": int(preset["max_resolution"]),
         "random_samples": int(preset["random_samples"]),
         "sticker_mode": bool(sticker_mode),
-        # Checkpoint cadence: 20 progress events per run gives the user
-        # a smooth-ish progress bar without burdening the IPC channel.
-        # Tunable per preset later if needed.
-        "checkpoint_every": max(1, int(preset["num_shapes"]) // 20),
+        "checkpoint_every": ce,
         "lock_alpha": True,   # hard system constraint per CLAUDE.md §3
         "preset_label": str(preset.get("label", "")),
         # Joint polish after greedy fill: N gradient/hill-climb steps

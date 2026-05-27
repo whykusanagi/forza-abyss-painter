@@ -27,7 +27,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
-    QVBoxLayout,
+    QSpinBox, QVBoxLayout,
 )
 
 from forza_abyss_painter.gui.gpu_gen_worker import GpuGenWorker, build_run_config
@@ -137,6 +137,20 @@ class GenerateLocallyDialog(QDialog):
         self.output_field = QLineEdit(self)
         self.output_field.setPlaceholderText("(defaults to source folder)")
         form.addRow("Output to:", self.output_field)
+
+        # Checkpoint cadence (snapshot every N shapes). GPU min 100 per
+        # #snapshot-resume §6 — power users can raise to 1000 to reduce
+        # disk writes on big runs.
+        self.checkpoint_every_spinbox = QSpinBox(self)
+        self.checkpoint_every_spinbox.setRange(100, 1000)
+        self.checkpoint_every_spinbox.setSingleStep(50)
+        self.checkpoint_every_spinbox.setValue(100)
+        self.checkpoint_every_spinbox.setToolTip(
+            "Save a partial snapshot every N shapes. Lets you resume "
+            "from the most recent snapshot if the run fails. Minimum "
+            "100 on GPU runs."
+        )
+        form.addRow("Snapshot every:", self.checkpoint_every_spinbox)
 
         root.addLayout(form)
 
@@ -313,6 +327,7 @@ class GenerateLocallyDialog(QDialog):
         config = build_run_config(
             self.source_path, out_path, preset,
             sticker_mode=False,   # TODO: tie to a sticker checkbox once added
+            checkpoint_every=int(self.checkpoint_every_spinbox.value()),
         )
         config_path = self.source_path.parent / (
             f".{self.source_path.stem}_gpu_config.json"
