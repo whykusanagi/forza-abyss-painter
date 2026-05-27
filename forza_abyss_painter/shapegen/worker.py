@@ -26,6 +26,7 @@ def _apply_upload_cap(
     profile_max_resolution: int,
     upload_cap_px: int,
     buffer_frac: float = 0.08,
+    upload_cap_override: int | None = None,
 ) -> tuple[Image.Image, np.ndarray | None, bool]:
     """Downscale img so the FINAL PADDED canvas stays under the upload cap.
 
@@ -44,13 +45,28 @@ def _apply_upload_cap(
     point shrinking below the preset's own ceiling, that would just lose
     detail without speeding anything up.
 
+    `upload_cap_override` (#131): when set, replaces upload_cap_px for
+    this call (subject to the floor min) — used by the back-prop
+    planner to raise the cap on big-VRAM cards. None preserves the
+    legacy behavior. `upload_cap_override=0` means "disable cap"
+    (same semantic as upload_cap_px=0). Otherwise the effective cap is
+    `max(upload_cap_px, upload_cap_override)` — back-prop only raises.
+
     Returns (img, alpha_mask, was_resized) so callers can log when the
     cap actually fired (useful for the UI: "auto-resized your 4K input
     to 720px for safety").
     """
-    if upload_cap_px <= 0:
+    if upload_cap_override is not None:
+        if upload_cap_override == 0:
+            effective_cap = 0   # explicit disable
+        else:
+            effective_cap = max(upload_cap_px, upload_cap_override)
+    else:
+        effective_cap = upload_cap_px
+
+    if effective_cap <= 0:
         return img, alpha_mask, False
-    effective_max = min(profile_max_resolution, upload_cap_px)
+    effective_max = min(profile_max_resolution, effective_cap)
     pad_factor = 1.0 + 2.0 * buffer_frac
     effective_input_max = max(1, int(effective_max / pad_factor))
     if max(img.size) <= effective_input_max:
