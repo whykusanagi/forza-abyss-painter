@@ -274,9 +274,14 @@ def test_run_writes_valid_fd6_shapes_json(tmp_path, _fake_engine, _fake_image):
 def test_run_progress_events_carry_total(tmp_path, _fake_engine, _fake_image):
     """Progress events tell the EXE 'X of T shapes done'. Without `total`
     the progress bar can't show a percentage — the dialog falls back to
-    an indeterminate spinner which is a worse UX."""
+    an indeterminate spinner which is a worse UX.
+
+    Uses device='cpu' so the cuda min-cadence guard (checkpoint_every >= 100
+    on cuda) doesn't block a sub-100 test value; this test is about IPC
+    event format, not GPU constraints."""
     d = _valid_config_dict(tmp_path)
     d["checkpoint_every"] = 50
+    d["device"] = "cpu"
     cfg = tr.RunConfig.from_dict(d)
     buf = io.StringIO()
     tr.run(cfg, stream=buf)

@@ -149,6 +149,13 @@ class RunConfig:
     input_shapes_path: Path | None = None
     polish_steps_override: int | None = None
 
+    # --- Resume support (#snapshot-resume) -----------------------------
+    # When set in fresh mode: runner loads the partial doc, replays its
+    # shapes onto the canvas, and continues the greedy loop from
+    # len(seeded) → num_shapes. polish_only + seed = ValueError (resume
+    # is fresh-only).
+    seed_shapes_path: Path | None = None
+
     @classmethod
     def from_dict(cls, d: dict) -> "RunConfig":
         """Parse + validate. Raises ValueError on missing required fields,
@@ -225,6 +232,24 @@ class RunConfig:
             input_shapes_path = None
             polish_steps_override = None
 
+        # seed_shapes_path: fresh-mode resume. Existence-check + mode
+        # gate. Polish + seed combined is meaningless (polish replays
+        # input_shapes_path; can't ALSO seed from somewhere else).
+        ssp = d.get("seed_shapes_path")
+        if ssp:
+            if mode == "polish_only":
+                raise ValueError(
+                    "seed_shapes_path is not supported in polish_only "
+                    "mode (resume is fresh-only)"
+                )
+            seed_shapes_path = Path(ssp)
+            if not seed_shapes_path.is_file():
+                raise ValueError(
+                    f"seed_shapes_path not found: {seed_shapes_path}"
+                )
+        else:
+            seed_shapes_path = None
+
         # Optional with type coercion (same across modes).
         lock_alpha = bool(d.get("lock_alpha", True))
         if not lock_alpha:
@@ -236,6 +261,12 @@ class RunConfig:
         device = str(d.get("device", "cuda"))
         if device not in ("cuda", "cpu"):
             raise ValueError(f"device must be 'cuda' or 'cpu', got {device!r}")
+        ce = int(d.get("checkpoint_every", 0))
+        if device == "cuda" and 0 < ce < 100:
+            raise ValueError(
+                f"checkpoint_every must be >= 100 on cuda (got {ce}); "
+                f"set 0 to disable snapshots entirely"
+            )
         return cls(
             image_path=image_path,
             output_json_path=output_json_path,
@@ -251,12 +282,13 @@ class RunConfig:
             vram_budget_gib=float(d.get("vram_budget_gib", 0.0)),
             lock_alpha=lock_alpha,
             progress_every=int(d.get("progress_every", 0)),
-            checkpoint_every=int(d.get("checkpoint_every", 0)),
+            checkpoint_every=ce,
             device=device,
             preset_label=str(d.get("preset_label", "")),
             mode=mode,
             input_shapes_path=input_shapes_path,
             polish_steps_override=polish_steps_override,
+            seed_shapes_path=seed_shapes_path,
         )
 
     def summary(self) -> dict:
