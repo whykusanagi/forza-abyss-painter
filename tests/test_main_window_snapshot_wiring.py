@@ -145,3 +145,45 @@ def test_resume_slot_handles_snapshot(qapp, tmp_path, monkeypatch):
     finally:
         win.close()
         win.deleteLater()
+
+
+def test_resume_blocked_while_run_active(qapp, tmp_path, monkeypatch):
+    """If a GPU run is in progress (self._thread.isRunning()), clicking
+    Resume must NOT overwrite self._worker/_thread. The old worker's
+    finished signal would later tear down the NEW thread."""
+    snap = tmp_path / "x_50.json"
+    _snapshot(snap)
+
+    # Build a fake "running thread" — a QThread.isRunning() check is
+    # the guard's source of truth. Use a real QThread that we keep
+    # alive via a slow callable. Simpler: monkeypatch isRunning to
+    # return True without actually starting a thread.
+    from PySide6.QtCore import QThread
+
+    win = MainWindow()
+    try:
+        # Stub up an "active" thread.
+        fake_thread = QThread()
+        monkeypatch.setattr(fake_thread, "isRunning", lambda: True)
+        win._thread = fake_thread
+        original_worker = getattr(win, "_worker", None)
+
+        # Patch QMessageBox.information so the modal doesn't actually
+        # block. Just record that it was called.
+        called: list = []
+        from PySide6.QtWidgets import QMessageBox
+        monkeypatch.setattr(QMessageBox, "information",
+                             lambda *args, **kwargs: called.append(args))
+
+        win._on_resume_requested(snap)
+
+        # The guard fired → modal shown, worker NOT overwritten.
+        assert called, "QMessageBox.information should have been called"
+        assert getattr(win, "_worker", None) is original_worker, (
+            "self._worker was overwritten despite active run"
+        )
+    finally:
+        # Don't call win._teardown_thread — the fake_thread isn't real.
+        win._thread = None
+        win.close()
+        win.deleteLater()

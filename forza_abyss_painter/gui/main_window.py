@@ -1599,6 +1599,20 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QDialog as _QDialog
         from pathlib import Path as _Path
 
+        # Guard against an active run. Resume button isn't gated by
+        # set_running(True), so we have to check here. If a worker is
+        # active, clicking Resume would overwrite self._worker/_thread
+        # and the old worker's finished signal would later tear down
+        # the NEW run's thread.
+        if getattr(self, "_thread", None) is not None and self._thread.isRunning():
+            QMessageBox.information(
+                self, "Run in progress",
+                "A GPU run is already in progress. Wait for it to finish "
+                "(or Cancel from the Generate dialog) before starting a "
+                "resume.",
+            )
+            return
+
         # Load + sanity-check snapshot.
         try:
             from forza_abyss_painter.io.exporter import load_json
