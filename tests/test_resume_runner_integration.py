@@ -10,12 +10,9 @@ from pathlib import Path
 
 import pytest
 
-torch = pytest.importorskip("torch")
-np = pytest.importorskip("numpy")
-PIL = pytest.importorskip("PIL")
-
 
 def _image(path: Path, h=32, w=32):
+    import numpy as np
     from PIL import Image
     arr = np.zeros((h, w, 3), dtype=np.uint8)
     arr[:, :w // 2] = (200, 80, 80)

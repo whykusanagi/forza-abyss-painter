@@ -637,6 +637,29 @@ def _run_polish_only(cfg: RunConfig, stream, logger) -> int:
     return 0
 
 
+def _build_run_config_block(cfg: "RunConfig") -> dict:
+    """Build the ``_run_config`` metadata block embedded in snapshot
+    and final-output JSONs.  Carries the original run params so resume
+    can replay with the same config.
+
+    DRY: snapshot and final-output writers both call this — keeps the
+    two sites in lockstep when fields are added/removed.
+    """
+    return {
+        "target_shape_count": int(cfg.num_shapes),
+        "random_samples": int(cfg.random_samples),
+        "max_resolution": int(cfg.max_resolution),
+        "edge_strength": float(cfg.edge_strength),
+        "posterize_levels": int(cfg.posterize_levels),
+        "sticker_mode": bool(cfg.sticker_mode),
+        "lock_alpha": bool(cfg.lock_alpha),
+        "bbox_local": bool(cfg.bbox_local),
+        "joint_polish_steps": int(cfg.joint_polish_steps),
+        "vram_budget_gib": float(cfg.vram_budget_gib),
+        "preset_label": str(cfg.preset_label),
+    }
+
+
 def _write_snapshot(
     cfg: "RunConfig",
     shapes_list: list,
@@ -669,19 +692,7 @@ def _write_snapshot(
         "profile": cfg.preset_label,
         "sticker_mode": bool(cfg.sticker_mode),
         "shapes": list(shapes_list),
-        "_run_config": {
-            "target_shape_count": int(cfg.num_shapes),
-            "random_samples": int(cfg.random_samples),
-            "max_resolution": int(cfg.max_resolution),
-            "edge_strength": float(cfg.edge_strength),
-            "posterize_levels": int(cfg.posterize_levels),
-            "sticker_mode": bool(cfg.sticker_mode),
-            "lock_alpha": bool(cfg.lock_alpha),
-            "bbox_local": bool(cfg.bbox_local),
-            "joint_polish_steps": int(cfg.joint_polish_steps),
-            "vram_budget_gib": float(cfg.vram_budget_gib),
-            "preset_label": str(cfg.preset_label),
-        },
+        "_run_config": _build_run_config_block(cfg),
     }
     tmp_path.write_text(_json.dumps(doc), encoding="utf-8")
     _os.replace(tmp_path, snap_path)
@@ -906,19 +917,7 @@ def run(cfg: RunConfig, stream=sys.stderr) -> int:
         doc_dict = _json.loads(
             cfg.output_json_path.read_text(encoding="utf-8")
         )
-        doc_dict["_run_config"] = {
-            "target_shape_count": int(cfg.num_shapes),
-            "random_samples": int(cfg.random_samples),
-            "max_resolution": int(cfg.max_resolution),
-            "edge_strength": float(cfg.edge_strength),
-            "posterize_levels": int(cfg.posterize_levels),
-            "sticker_mode": bool(cfg.sticker_mode),
-            "lock_alpha": bool(cfg.lock_alpha),
-            "bbox_local": bool(cfg.bbox_local),
-            "joint_polish_steps": int(cfg.joint_polish_steps),
-            "vram_budget_gib": float(cfg.vram_budget_gib),
-            "preset_label": str(cfg.preset_label),
-        }
+        doc_dict["_run_config"] = _build_run_config_block(cfg)
         cfg.output_json_path.write_text(
             _json.dumps(doc_dict), encoding="utf-8",
         )

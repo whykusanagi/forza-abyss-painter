@@ -11,12 +11,9 @@ from pathlib import Path
 
 import pytest
 
-torch = pytest.importorskip("torch")
-np = pytest.importorskip("numpy")
-PIL = pytest.importorskip("PIL")
-
 
 def _image(path: Path, h=32, w=32):
+    import numpy as np
     from PIL import Image
     arr = np.zeros((h, w, 3), dtype=np.uint8)
     arr[:, :w // 2] = (200, 80, 80)
@@ -24,12 +21,15 @@ def _image(path: Path, h=32, w=32):
     Image.fromarray(arr, "RGB").save(path)
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() and os.environ.get("FAP_SNAPSHOT_TEST_FORCE_CPU") != "1",
-    reason="snapshot test runs the real runner; skipping on CPU-only host. "
-           "Set FAP_SNAPSHOT_TEST_FORCE_CPU=1 to force.",
-)
 def test_runner_writes_snapshots_at_each_checkpoint(tmp_path):
+    try:
+        import torch
+    except ImportError:
+        pytest.skip("torch not installed in test env")
+    if not torch.cuda.is_available() and os.environ.get("FAP_SNAPSHOT_TEST_FORCE_CPU") != "1":
+        pytest.skip(
+            "CUDA not available; set FAP_SNAPSHOT_TEST_FORCE_CPU=1 to force CPU run"
+        )
     image = tmp_path / "img.png"
     _image(image)
     out = tmp_path / "out" / "fixture.json"
