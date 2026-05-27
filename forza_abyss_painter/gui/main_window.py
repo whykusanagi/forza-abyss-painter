@@ -22,7 +22,7 @@ from forza_abyss_painter.shapegen.profile import Profile
 from forza_abyss_painter.shapegen.worker import GenerationWorker
 from forza_abyss_painter.inject.fh6_injector import patterns_are_populated, FH6_TARGET_BUILD
 from forza_abyss_painter.suite import SuiteMode, SUITE_DISPLAY, saved_suite_mode, save_suite_mode
-from forza_abyss_painter.runtime.nvidia_smi import probe_free_vram
+from forza_abyss_painter.runtime.nvidia_smi import probe_free_vram, ProbeResult
 
 
 def _vram_preflight_verdict(
@@ -76,7 +76,10 @@ def _resolve_source_image_path(json_path: Path, source_image_name: str) -> Path 
     return candidate if candidate.is_file() else None
 
 
-def _apply_autotune_to_preset(preset: dict) -> tuple[dict, str]:
+def _apply_autotune_to_preset(
+    preset: dict,
+    probe: "ProbeResult | None" = None,
+) -> tuple[dict, str]:
     """Apply the #131 back-prop recommendation to a GPU preset dict.
 
     Returns a NEW dict (input is not mutated) with `max_resolution`
@@ -85,14 +88,15 @@ def _apply_autotune_to_preset(preset: dict) -> tuple[dict, str]:
     that preset). The second element is a human-readable status line
     the caller can log to the status bar.
 
-    `probe_free_vram` is called with force=True to bypass the 5s cache
-    — the user just clicked Start, so fresh data is worth the
-    subprocess spawn cost.
+    `probe` lets the caller share an already-fetched ProbeResult to
+    avoid spawning nvidia-smi twice (#131 review GAP 4). When None,
+    the helper fetches one itself with `force=True`.
     """
     bumped = dict(preset)   # shallow copy; preset's leaf values are scalars
     baked_max_res = int(bumped["max_resolution"])
     K = int(bumped.get("random_samples", 0) or 0)
-    probe = probe_free_vram(force=True)
+    if probe is None:
+        probe = probe_free_vram(force=True)
     if probe.available and probe.free_gib is not None and K > 0:
         from forza_abyss_painter.shapegen.gpu.vram_planner import (
             recommend_max_resolution,
@@ -1115,28 +1119,48 @@ class MainWindow(QMainWindow):
             self.queue.set_status(image_path, "queued")
             return
 
-        # VRAM budget + chunked-K pre-flight. Compute the predicted
-        # peak from the user's current settings and the budget they
-        # picked. Instead of REFUSING runs that exceed budget (the
-        # old UX), we now PASS THE BUDGET to the engine which
-        # auto-splits the K-batch into chunks that fit. Wall time
-        # scales linearly with chunk count, but the run completes
-        # at the same quality.
-        #
-        # This is the painter-fh6 architectural trade-off
-        # generalized: "set budget, let it cook" — exactly what
-        # casual users wanted but couldn't get without manually
-        # tuning random_samples / max_resolution.
-        peak_gib = self.settings_panel.estimate_peak_vram_gib(profile)
+        # Build the baked preset dict (what the profile defaults to).
+        preset_baked = {
+            "label": profile.name,
+            "num_shapes": profile.stop_at,
+            "max_resolution": profile.max_resolution,
+            "random_samples": profile.random_samples,
+        }
         budget_gib = self.settings_panel.selected_vram_budget_gib()
 
-        # Pre-launch nvidia-smi free-VRAM probe (#125). Cursor's Run 4
-        # showed chunked-K reduces K-batch peak but not the total process
-        # footprint (canvas + refill + joint_polish). The 15× safety
-        # multiplier in vram_planner is calibrated against that — if
-        # peak > free, the run WILL OOM regardless of chunking.
+        # Probe free VRAM ONCE — preflight + autotune share the result so
+        # they see the same VRAM snapshot (no TOCTOU, no double nvidia-smi
+        # subprocess spawn). (#131 review GAP 4)
         probe = probe_free_vram(force=True)
         free_gib = probe.free_gib if probe.available else None
+
+        # Autotune the preset FIRST (#131 review BLOCKER 1). Subsequent
+        # peak_gib estimate + preflight evaluate against the BUMPED
+        # max_resolution — otherwise a baked-at-480 preset that autotunes
+        # to 1319 would pass the block-guard at the baked peak but OOM at
+        # the bumped peak.
+        preset, autotune_message = _apply_autotune_to_preset(
+            preset_baked, probe=probe,
+        )
+
+        # Compute peak_gib from the BUMPED preset, not the baked profile.
+        # This is the painter-fh6 architectural trade-off generalized:
+        # "set budget, let it cook" — but now the guard sees the real
+        # post-autotune estimate, not the pre-autotune baked value.
+        from forza_abyss_painter.shapegen.gpu.vram_planner import (
+            estimate_peak_vram_gib,
+        )
+        peak_gib = estimate_peak_vram_gib(
+            K=int(preset["random_samples"]),
+            bbox_local=True,
+            max_resolution=int(preset["max_resolution"]),
+        )
+
+        # Three-tier preflight (Item E): block / warn / ok.
+        # Cursor's Run 4 showed chunked-K reduces K-batch peak but not
+        # the total process footprint (canvas + refill + joint_polish).
+        # The 15× safety multiplier in vram_planner is calibrated against
+        # that — if peak > free, the run WILL OOM regardless of chunking.
         severity, summary = _vram_preflight_verdict(peak_gib, free_gib, budget_gib)
 
         if severity == "block":
@@ -1144,8 +1168,9 @@ class MainWindow(QMainWindow):
                 self,
                 "Won't fit in free VRAM — cannot start",
                 f"<b>{summary}</b><br><br>"
-                f"This preset estimates a peak of "
-                f"<b>~{peak_gib:.1f} GiB</b> but only "
+                f"This preset (after #131 auto-tune to "
+                f"<b>{preset['max_resolution']} px</b>) estimates a peak "
+                f"of <b>~{peak_gib:.1f} GiB</b> but only "
                 f"<b>{free_gib:.1f} GiB</b> is currently free on "
                 f"{probe.name or 'the GPU'}.<br><br>"
                 f"<b>Chunked-K can't save this run</b> — the estimate "
@@ -1182,6 +1207,8 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.Yes:
                 self.queue.set_status(image_path, "queued")
                 return
+
+        # Chunked-K dialog uses the bumped peak_gib too (#131 review BLOCKER 2).
         chunk_warning = ""
         if budget_gib > 0 and peak_gib > budget_gib * 0.85:
             n_chunks = max(2, int(peak_gib / (budget_gib * 0.85)) + 1)
@@ -1214,19 +1241,6 @@ class MainWindow(QMainWindow):
             chunk_warning = (
                 f" (auto-chunked into ~{n_chunks}, wall time ~{n_chunks}×)"
             )
-        # Build a preset dict matching gpu_gen_worker.build_run_config()'s
-        # expected fields. Source values from the SettingsPanel so what
-        # the user picked in CPU mode carries over to GPU. Apply the
-        # #131 back-prop recommendation BEFORE handing to the runner so
-        # big-VRAM cards get the bumped max_resolution.
-        preset_baked = {
-            "label": profile.name,
-            "num_shapes": profile.stop_at,
-            "max_resolution": profile.max_resolution,
-            "random_samples": profile.random_samples,
-        }
-        preset, autotune_message = _apply_autotune_to_preset(preset_baked)
-        self.statusBar().showMessage(autotune_message, 6000)
         from forza_abyss_painter.gui.gpu_gen_worker import build_run_config
         output_path = image_path.parent / image_path.stem / f"{image_path.stem}.json"
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1265,9 +1279,13 @@ class MainWindow(QMainWindow):
         self._gpu_run_start_t = _time.monotonic()
         self._thread.start()
         self.settings_panel.set_running(True)
+        # Embed the autotune outcome in the "GPU generating" message
+        # (#131 review GAP 3 fix). Previously the autotune showMessage(6000ms)
+        # was synchronously overwritten by this line before the event loop
+        # rendered a single frame.
         self.statusBar().showMessage(
-            f"GPU generating: {image_path.name} (no live preview — "
-            f"final result loads when done)"
+            f"GPU generating: {image_path.name}{chunk_warning} — "
+            f"{autotune_message} (no live preview — final result loads when done)"
         )
 
     def _on_gpu_progress(self, shape_count: int, total: int) -> None:

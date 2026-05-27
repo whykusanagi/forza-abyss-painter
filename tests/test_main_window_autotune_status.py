@@ -84,6 +84,42 @@ def test_apply_autotune_preserves_baked_value_on_probe_failure(monkeypatch):
            "safety floor" in message.lower()
 
 
+def test_available_probe_but_recommendation_below_baked(monkeypatch):
+    """Probe succeeds but the back-prop value is below the baked preset
+    floor → return baked + a "using floor" message that does NOT
+    falsely claim probe-unavailable."""
+    from forza_abyss_painter.runtime import nvidia_smi as ns_mod
+
+    def fake_probe(*, force=False):
+        # 2 GiB free at K=12288 → recommend_max_resolution returns a value
+        # well below 1000 (the baked floor); effective = baked = 1000.
+        return ns_mod.ProbeResult(
+            available=True,
+            free_mib=2 * 1024, total_mib=24 * 1024,
+            name="Tight GPU",
+            driver_version="555.85",
+            probed_at=0.0,
+        )
+
+    monkeypatch.setattr(
+        "forza_abyss_painter.gui.main_window.probe_free_vram",
+        fake_probe,
+    )
+    preset = {
+        "label": "Hi-Res — 3000 shapes",
+        "num_shapes": 3000,
+        "max_resolution": 1000,
+        "random_samples": 12288,
+    }
+    bumped, message = main_window_mod._apply_autotune_to_preset(preset)
+    assert bumped["max_resolution"] == 1000
+    # Message should mention the floor + the free-GiB context, but NOT
+    # claim the probe was unavailable.
+    assert "using floor" in message.lower()
+    assert "GiB free" in message
+    assert "probe unavailable" not in message.lower()
+
+
 def test_apply_autotune_does_not_mutate_input(big_card_probe):
     preset = {
         "label": "Test",
