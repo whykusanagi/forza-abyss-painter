@@ -25,11 +25,14 @@ runtime: ~5 seconds.
 
 ## Usage
 
+Run the `fap-refresh` entry point that ships alongside the EXE:
+
     fap-refresh
 
-Or as a python module if entry point isn't on PATH:
-
-    "<EXE bundle>\\python.exe" -m forza_abyss_painter.cli.refresh
+Do NOT invoke as `<runtime>\\python.exe -m forza_abyss_painter.cli.refresh`
+— that runs from the embedded runtime where source and destination are
+the same directory; the script will refuse with exit 2 to avoid
+destroying the embedded shapegen tree.
 
 The CLI uses the same `_copy_runner_package` helper `install_runtime`
 calls — guaranteed identical layout to a fresh install, so the
@@ -144,6 +147,35 @@ def main(argv: "list[str] | None" = None) -> int:
                 print(f"  {src} → {site_pkgs}/forza_abyss_painter/{sub} "
                       f"(~{size_mb:.1f} MiB)")
         return 0
+
+    # Guard against self-destruction (Cursor Run 6 R6.8). When this CLI
+    # is invoked from the embedded Python (e.g.,
+    # `<runtime>\python.exe -m forza_abyss_painter.cli.refresh`),
+    # `_source_package_dir()` resolves to the embedded site-packages's
+    # forza_abyss_painter dir — i.e., the SAME directory we're about to
+    # copy INTO. `_copy_runner_package` would then rmtree each
+    # subpackage's destination (which IS the source) before copytree
+    # tried to read from the just-deleted path → WinError 3 → leaves
+    # the embedded shapegen dir DESTROYED.
+    #
+    # The legitimate invocation is from the PyInstaller EXE bundle,
+    # where _source_package_dir resolves to the on-disk extraction
+    # inside _MEIPASS (a different dir). Refuse the self-destruct case
+    # with a clear error pointing the user at the right invocation.
+    dest_pkg = site_pkgs / "forza_abyss_painter"
+    if src_pkg.resolve() == dest_pkg.resolve():
+        print(
+            f"fap-refresh: source and destination are the same directory "
+            f"({src_pkg}).\n"
+            f"  This happens when invoked from the embedded Python.\n"
+            f"  Run fap-refresh from the PyInstaller EXE bundle instead "
+            f"(Tools menu inside the EXE, or the fap-refresh entry point "
+            f"installed alongside the EXE — NOT the runtime's python.exe).\n"
+            f"  Running here would delete the embedded shapegen + reinstall "
+            f"from itself, leaving the runtime broken.",
+            file=sys.stderr,
+        )
+        return 2
 
     # Real copy.
     print(f"\nRefreshing {len(RUNNER_REQUIRED_SUBPACKAGES)} subpackages…")
