@@ -24,6 +24,7 @@ changes, update this module's `_peak_bytes_per_candidate` too.
 """
 from __future__ import annotations
 
+import math
 
 # Calibrated safety multipliers for each scoring path. RE-CALIBRATED
 # 2026-05-25 against Cursor's QUASAR smoke evidence:
@@ -47,6 +48,11 @@ FULL_CANVAS_SAFETY = 8.0    # was 3.5; same calibration ratio applied
 # Chunk-size floor — Python overhead dominates below this; budgets
 # too tight to fit 8 candidates are user errors (lower the resolution).
 MIN_CHUNK_SIZE = 8
+
+# 3 RGB channels × 4 bytes/float32. The full per-pixel cost is
+# _BYTES_PER_PIXEL_RAW * BBOX_LOCAL_SAFETY (or _FULL_CANVAS_SAFETY).
+# Update this if the scorers ever switch to float16, add alpha, etc.
+_BYTES_PER_PIXEL_RAW = 12.0
 
 
 def _peak_bytes_per_candidate(
@@ -72,7 +78,7 @@ def _peak_bytes_per_candidate(
         footprint = res * res
         safety = FULL_CANVAS_SAFETY
     # 3 channels × 4 bytes/float32 = 12 bytes/pixel × safety
-    return footprint * 12.0 * safety
+    return footprint * _BYTES_PER_PIXEL_RAW * safety
 
 
 def estimate_peak_vram_gib(
@@ -159,8 +165,6 @@ def recommend_max_resolution(
     Regime B is the "we're past the bbox cap; canvas size no longer
     affects K-peak" regime — if it fits, ceiling out.
     """
-    import math as _math
-
     if free_gib <= 0 or K < 1:
         return safety_floor_px
 
@@ -169,7 +173,7 @@ def recommend_max_resolution(
         safety = BBOX_LOCAL_SAFETY
     else:
         safety = FULL_CANVAS_SAFETY
-    bytes_per_pixel = 12.0 * safety   # 3 channels × 4 bytes × safety
+    bytes_per_pixel = _BYTES_PER_PIXEL_RAW * safety   # 3 channels × 4 bytes × safety
 
     # Regime B check: at crop_e = bbox_crop_max, footprint is constant.
     # If THAT fits, then any max_res >= bbox_crop_max * 8 is fine.
@@ -188,15 +192,13 @@ def recommend_max_resolution(
     inner = target_bytes / (K * bytes_per_pixel)
     if inner <= 1:
         return safety_floor_px
-    sqrt_inner = _math.sqrt(inner)
-    if sqrt_inner <= 1:
-        return safety_floor_px
+    sqrt_inner = math.sqrt(inner)
     max_res = int(8 * (sqrt_inner - 1) / 2)
 
     # full_canvas path uses the canvas² footprint (no bbox cap), so the
-    # solve is just: max_res² <= target_bytes / (K * bytes_per_pixel).
+    # solve is just: max_res² <= target_bytes / (K * bytes_per_pixel) = inner.
     if not bbox_local:
-        max_res = int(_math.sqrt(target_bytes / (K * bytes_per_pixel)))
+        max_res = int(sqrt_inner)
 
     # Floor + ceiling clamps.
     max_res = max(safety_floor_px, max_res)
