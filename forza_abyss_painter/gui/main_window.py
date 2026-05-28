@@ -1410,6 +1410,12 @@ class MainWindow(QMainWindow):
         self._polish_worker.moveToThread(self._polish_thread)
         self._polish_thread.started.connect(self._polish_worker.run)
         self._polish_worker.started.connect(self._on_polish_started)
+        # Chunked-K Task 4: also drive the middle PreviewPanel so the
+        # polish run isn't invisible there. CPU + GPU-fresh + Resume
+        # all do this; Polish was the odd one out, updating only the
+        # bottom QMainWindow status bar via _on_polish_progress.
+        self._polish_worker.progress.connect(self.preview.on_progress)
+        self._polish_worker.checkpoint.connect(self.preview.on_progress)
         self._polish_worker.progress.connect(self._on_polish_progress)
         self._polish_worker.checkpoint.connect(self._on_polish_progress)
         self._polish_worker.done.connect(self._on_polish_done)
@@ -1647,6 +1653,14 @@ class MainWindow(QMainWindow):
 
     def _on_polish_started(self, summary: dict) -> None:
         self.statusBar().showMessage("Polish started — running joint_polish on GPU…")
+        # Chunked-K Task 4: surface polish state on the middle
+        # PreviewPanel too. Without this the panel keeps whatever label
+        # it had before polish (often "Idle." or the last fresh-gen
+        # status) and the user has no signal anything is running.
+        self.preview.status_label.setText(
+            "Polishing — running joint_polish optimizer…"
+        )
+        self.preview.progress.setValue(0)
 
     def _on_polish_progress(self, current: int, total: int) -> None:
         if total > 0:
@@ -1656,6 +1670,13 @@ class MainWindow(QMainWindow):
         path = Path(output_path)
         self.statusBar().showMessage(
             f"Polish done — {shape_count} shapes saved to {path.name}", 10000,
+        )
+        # Chunked-K Task 4: leave the middle PreviewPanel on a clear
+        # "done" state instead of whatever step count the last
+        # progress signal happened to leave it at.
+        self.preview.progress.setValue(100)
+        self.preview.status_label.setText(
+            f"Polish done — {shape_count} shapes"
         )
         # Auto-load the polished JSON into the preview so the user can
         # compare visually + click Inject when ready.
@@ -1668,6 +1689,11 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, f"Polish failed — {stage}",
                               f"Stage: {stage}\n\n{message}")
         self.statusBar().showMessage(f"Polish failed at {stage}.", 10000)
+        # Chunked-K Task 4: surface the failure on the middle panel
+        # too, otherwise it'd stay stuck on "Polishing…" with a
+        # half-filled progress bar.
+        self.preview.status_label.setText(f"Polish failed at {stage}")
+        self.preview.progress.setValue(0)
         self._polish_thread = None
         self._polish_worker = None
 
