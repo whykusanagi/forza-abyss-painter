@@ -34,7 +34,7 @@ from forza_abyss_painter.gui.gpu_gen_worker import GpuGenWorker, build_run_confi
 from forza_abyss_painter.runtime.nvidia_smi import probe_free_vram
 from forza_abyss_painter.runtime.torch_installer import embedded_python_exe
 from forza_abyss_painter.shapegen.gpu.vram_planner import (
-    estimate_full_pipeline_gib,
+    estimate_peak_vram_gib,
     recommend_max_resolution,
 )
 
@@ -129,7 +129,7 @@ class GenerateLocallyDialog(QDialog):
         # Preset dropdown.
         self.preset_combo = QComboBox(self)
         for p in LOCAL_PRESETS:
-            live_peak = estimate_full_pipeline_gib(
+            live_peak = estimate_peak_vram_gib(
                 K=int(p["random_samples"]),
                 bbox_local=True,
                 max_resolution=int(p["max_resolution"]),
@@ -281,7 +281,7 @@ class GenerateLocallyDialog(QDialog):
         preset.setdefault("baked_max_resolution", baked_max_res)
         preset["max_resolution"] = effective_max_res
 
-        live_peak = estimate_full_pipeline_gib(
+        live_peak = estimate_peak_vram_gib(
             K=int(preset["random_samples"]),
             bbox_local=True,
             max_resolution=int(preset["max_resolution"]),
@@ -314,7 +314,7 @@ class GenerateLocallyDialog(QDialog):
         # Phase 3 will subprocess-call torch_runner to do the probe. For
         # now show the live full-pipeline estimate, with a generic
         # recommendation.
-        est = estimate_full_pipeline_gib(
+        est = estimate_peak_vram_gib(
             K=int(preset["random_samples"]),
             bbox_local=True,
             max_resolution=int(preset["max_resolution"]),

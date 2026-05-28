@@ -318,10 +318,8 @@ class SettingsPanel(QWidget):
         return int(data) if data is not None else 0
 
     def estimate_peak_vram_gib(self, profile) -> float:
-        """Single source of truth in `vram_planner.estimate_full_pipeline_gib`.
-        Returns the full-pipeline VRAM estimate (K-scorer + canvas +
-        refill + joint_polish + allocator overhead). Use this for
-        UI labels + preflight decisions, NOT for chunking math.
+        """Single source of truth in `vram_planner.estimate_peak_vram_gib`
+        (K-only formula calibrated against Run 4 measurement).
 
         Always passes bbox_local=True because the EXE shape-gen runs
         ellipse-only + gradient mode (the production preset). If we
@@ -329,9 +327,9 @@ class SettingsPanel(QWidget):
         the flag through.
         """
         from forza_abyss_painter.shapegen.gpu.vram_planner import (
-            estimate_full_pipeline_gib,
+            estimate_peak_vram_gib,
         )
-        return estimate_full_pipeline_gib(
+        return estimate_peak_vram_gib(
             K=max(1, int(profile.random_samples)),
             bbox_local=True,
             max_resolution=max(64, int(profile.max_resolution)),
