@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 from forza_abyss_painter.gui.ac_settings_panel import ACSettingsPanel
 from forza_abyss_painter.gui.brand_banner import BrandBanner, badge_path
 from forza_abyss_painter.gui.game_suite_dialog import GameSuiteDialog
+from forza_abyss_painter.gui.gpu_preflight import gpu_run_preflight
 from forza_abyss_painter.gui.preview_panel import PreviewPanel
 from forza_abyss_painter.gui.texture_preview_panel import TexturePreviewPanel
 from forza_abyss_painter.gui.themes import THEMES, apply_theme, saved_theme_name, badge_filename_for_theme
@@ -23,42 +24,6 @@ from forza_abyss_painter.shapegen.worker import GenerationWorker
 from forza_abyss_painter.inject.fh6_injector import patterns_are_populated, FH6_TARGET_BUILD
 from forza_abyss_painter.suite import SuiteMode, SUITE_DISPLAY, saved_suite_mode, save_suite_mode
 from forza_abyss_painter.runtime.nvidia_smi import probe_free_vram, ProbeResult
-
-
-def _vram_preflight_verdict(
-    peak_gib: float, free_gib: float | None, budget_gib: float,
-) -> tuple[str, str]:
-    """Return (severity, recommendation) for a GPU pre-Start check.
-
-    severity:
-      - "ok"        — peak fits comfortably in free; no dialog needed.
-      - "warn"      — peak > 0.85 * free OR free < 0.9 * budget; surface
-                      a "proceed anyway?" dialog with chunked-K guidance.
-      - "block"     — peak > free; the run will OOM regardless of chunking
-                      (canvas/refill/joint_polish overhead is in the
-                      estimate but not reduced by K-chunking).
-
-    `free_gib=None` (probe unavailable, non-NVIDIA box) returns "ok" —
-    we can't make a free-vs-peak comparison so we let the existing
-    chunked-K fallback handle whatever happens at runtime.
-
-    recommendation is a one-line user-facing summary the caller can
-    paste into a dialog body.
-    """
-    if free_gib is None or free_gib <= 0:
-        return "ok", ""
-    if peak_gib > free_gib:
-        return "block", (
-            f"Estimated peak ~{peak_gib:.1f} GiB exceeds {free_gib:.1f} "
-            f"GiB free. Close other GPU apps or lower the preset."
-        )
-    if peak_gib > free_gib * 0.85 or free_gib < budget_gib * 0.9:
-        return "warn", (
-            f"Estimated peak ~{peak_gib:.1f} GiB vs {free_gib:.1f} GiB "
-            f"free (budget {budget_gib:.0f}). Chunked-K may help; may "
-            f"still OOM if free shrinks."
-        )
-    return "ok", ""
 
 
 def _resolve_source_image_path(json_path: Path, source_image_name: str) -> Path | None:
@@ -74,56 +39,6 @@ def _resolve_source_image_path(json_path: Path, source_image_name: str) -> Path 
     bare = Path(source_image_name).name   # strip any embedded path
     candidate = json_path.parent / bare
     return candidate if candidate.is_file() else None
-
-
-def _apply_autotune_to_preset(
-    preset: dict,
-    probe: "ProbeResult | None" = None,
-) -> tuple[dict, str]:
-    """Apply the #131 back-prop recommendation to a GPU preset dict.
-
-    Returns a NEW dict (input is not mutated) with `max_resolution`
-    bumped to the back-prop value when bigger than the baked preset
-    value (never lower — the preset author's choice is the floor for
-    that preset). The second element is a human-readable status line
-    the caller can log to the status bar.
-
-    `probe` lets the caller share an already-fetched ProbeResult to
-    avoid spawning nvidia-smi twice (#131 review GAP 4). When None,
-    the helper fetches one itself with `force=True`.
-    """
-    bumped = dict(preset)   # shallow copy; preset's leaf values are scalars
-    baked_max_res = int(bumped["max_resolution"])
-    K = int(bumped.get("random_samples", 0) or 0)
-    if probe is None:
-        probe = probe_free_vram(force=True)
-    if probe.available and probe.free_gib is not None and K > 0:
-        from forza_abyss_painter.shapegen.gpu.vram_planner import (
-            recommend_max_resolution,
-        )
-        recommended = recommend_max_resolution(
-            free_gib=probe.free_gib, K=K, bbox_local=True,
-        )
-        effective = max(baked_max_res, recommended)
-        bumped["max_resolution"] = effective
-        if effective > baked_max_res:
-            message = (
-                f"Auto-tuned max_res to {effective} px "
-                f"({probe.name or 'GPU'}, {probe.free_gib:.1f} GiB free)"
-            )
-        else:
-            message = (
-                f"Using baked max_res {baked_max_res} px "
-                f"({probe.free_gib:.1f} GiB free; back-prop says "
-                f"{recommended} px — using floor)"
-            )
-    else:
-        bumped["max_resolution"] = baked_max_res
-        message = (
-            f"Using baked max_res {baked_max_res} px "
-            f"(VRAM probe unavailable; using safety floor)"
-        )
-    return bumped, message
 
 
 class MainWindow(QMainWindow):
@@ -1134,87 +1049,51 @@ class MainWindow(QMainWindow):
         }
         budget_gib = self.settings_panel.selected_vram_budget_gib()
 
-        # Probe free VRAM ONCE — preflight + autotune share the result so
-        # they see the same VRAM snapshot (no TOCTOU, no double nvidia-smi
-        # subprocess spawn). (#131 review GAP 4)
-        probe = probe_free_vram(force=True)
-        free_gib = probe.free_gib if probe.available else None
-
-        # Autotune the preset FIRST (#131 review BLOCKER 1). Subsequent
-        # peak_gib estimate + preflight evaluate against the BUMPED
-        # max_resolution — otherwise a baked-at-480 preset that autotunes
-        # to 1319 would pass the block-guard at the baked peak but OOM at
-        # the bumped peak.
-        preset, autotune_message = _apply_autotune_to_preset(
-            preset_baked, probe=probe,
+        # Centralized 3-tier preflight + back-prop modal (Correction
+        # Task 4). The helper probes free VRAM, runs the back-prop
+        # recommendation, surfaces a "Lower to N / Cancel" modal when
+        # the baked max_res won't fit, then evaluates the block/warn/ok
+        # verdict against the (possibly lowered) effective preset.
+        proceed, preset = gpu_run_preflight(
+            parent=self,
+            preset=preset_baked,
+            budget_gib=float(budget_gib),
+            context="Generate from drop",
         )
+        if not proceed:
+            self.queue.set_status(image_path, "queued")
+            self.statusBar().showMessage(
+                "GPU run cancelled — VRAM preflight blocked.", 5000,
+            )
+            return
 
-        # Compute peak_gib from the BUMPED preset, not the baked profile.
-        # This is the painter-fh6 architectural trade-off generalized:
-        # "set budget, let it cook" — but now the guard sees the real
-        # post-autotune estimate, not the pre-autotune baked value.
+        # Construct the autotune breadcrumb the status bar appended
+        # before this refactor. We compare the effective max_resolution
+        # against the baked value to phrase it: unchanged → "Using
+        # baked max_res ...", bumped/lowered → "Effective max_res ...".
+        baked_max_res = int(preset_baked["max_resolution"])
+        effective_max_res = int(preset["max_resolution"])
+        if effective_max_res != baked_max_res:
+            autotune_message = (
+                f"Effective max_res {effective_max_res} px "
+                f"(baked {baked_max_res} px)"
+            )
+        else:
+            autotune_message = f"Using baked max_res {baked_max_res} px"
+
+        # Compute peak_gib from the effective preset for the chunked-K
+        # dialog below — the helper has already done this internally
+        # for its verdict, but doesn't return the number.
         from forza_abyss_painter.shapegen.gpu.vram_planner import (
             estimate_peak_vram_gib,
         )
         peak_gib = estimate_peak_vram_gib(
             K=int(preset["random_samples"]),
             bbox_local=True,
-            max_resolution=int(preset["max_resolution"]),
+            max_resolution=effective_max_res,
         )
 
-        # Three-tier preflight (Item E): block / warn / ok.
-        # Cursor's Run 4 showed chunked-K reduces K-batch peak but not
-        # the total process footprint (canvas + refill + joint_polish).
-        # The 15× safety multiplier in vram_planner is calibrated against
-        # that — if peak > free, the run WILL OOM regardless of chunking.
-        severity, summary = _vram_preflight_verdict(peak_gib, free_gib, budget_gib)
-
-        if severity == "block":
-            QMessageBox.critical(
-                self,
-                "Won't fit in free VRAM — cannot start",
-                f"<b>{summary}</b><br><br>"
-                f"This preset (after #131 auto-tune to "
-                f"<b>{preset['max_resolution']} px</b>) estimates a peak "
-                f"of <b>~{peak_gib:.1f} GiB</b> but only "
-                f"<b>{free_gib:.1f} GiB</b> is currently free on "
-                f"{probe.name or 'the GPU'}.<br><br>"
-                f"<b>Chunked-K can't save this run</b> — the estimate "
-                f"already includes non-K overhead (canvas, refill, "
-                f"joint_polish). Run 4 evidence: 47.5 GiB allocated on "
-                f"a 32 GiB GPU even with chunking active.<br><br>"
-                f"<b>Fixes (in order of effort):</b><br>"
-                f"  • Close FH6, Chrome, Discord, other GPU apps<br>"
-                f"  • Lower <b>Random samples</b> (e.g. 8192 → 4096)<br>"
-                f"  • Lower <b>Max resolution</b> (e.g. 720 → 600)<br>"
-                f"  • Pick a smaller preset",
-                QMessageBox.Ok,
-            )
-            self.queue.set_status(image_path, "queued")
-            return
-
-        if severity == "warn":
-            answer = QMessageBox.question(
-                self, "Less free VRAM than expected",
-                f"<b>{summary}</b><br><br>"
-                f"This preset estimates ~{peak_gib:.1f} GiB peak vs "
-                f"{free_gib:.1f} GiB free on "
-                f"{probe.name or 'the GPU'} (budget {budget_gib} GiB).<br><br>"
-                f"Likely cause: another process (FH6, browser, another "
-                f"GPU job) is holding memory.<br><br>"
-                f"<b>Recommended:</b> close other GPU apps and re-Start. "
-                f"Or proceed and let the engine chunk-K against the "
-                f"smaller free pool — slower, may still OOM if free "
-                f"shrinks further.<br><br>"
-                f"Proceed anyway?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if answer != QMessageBox.Yes:
-                self.queue.set_status(image_path, "queued")
-                return
-
-        # Chunked-K dialog uses the bumped peak_gib too (#131 review BLOCKER 2).
+        # Chunked-K dialog uses the effective peak_gib (#131 review BLOCKER 2).
         chunk_warning = ""
         if budget_gib > 0 and peak_gib > budget_gib * 0.85:
             n_chunks = max(2, int(peak_gib / (budget_gib * 0.85)) + 1)
