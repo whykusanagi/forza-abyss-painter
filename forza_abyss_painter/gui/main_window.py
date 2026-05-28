@@ -939,11 +939,18 @@ class MainWindow(QMainWindow):
                     6000,
                 )
             return
-        # Forza path — unchanged from v0.3.0 behavior.
+        # Forza path — queue but don't auto-start. The Start button
+        # (settings_panel.start_clicked) is the only trigger for a fresh
+        # run from a quiet queue. Once running, the auto-chain in
+        # _on_done still picks up the next queued item — that's batch
+        # processing UX and stays intact.
         for p in paths:
             self.queue.add(p)
         if self._worker is None:
-            self._start_next()
+            self.statusBar().showMessage(
+                f"Queued {len(paths)} image(s). Click Start to begin.",
+                6000,
+            )
 
     def _refresh_ac_preview(self) -> None:
         """Rebuild the AC cycling-slot preview from the current source image
