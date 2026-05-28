@@ -807,7 +807,10 @@ class MainWindow(QMainWindow):
         from forza_abyss_painter.gui.generate_dialog import (
             open_generate_dialog_if_runtime_ready,
         )
-        out = open_generate_dialog_if_runtime_ready(self)
+        out = open_generate_dialog_if_runtime_ready(
+            self,
+            gpu_budget_gib=float(self.settings_panel.selected_vram_budget_gib()),
+        )
         if out is not None and out.exists():
             # Reuse the existing JSON-load preview path so the generated
             # output flows through the same preview + inject lineup as an
@@ -1338,7 +1341,11 @@ class MainWindow(QMainWindow):
         )
         if not prompt_install_or_use_existing(self):
             return
-        dlg = GenerateLocallyDialog(self, initial_source_path=source)
+        dlg = GenerateLocallyDialog(
+            self,
+            initial_source_path=source,
+            gpu_budget_gib=float(self.settings_panel.selected_vram_budget_gib()),
+        )
         from PySide6.QtWidgets import QDialog as _QDialog
         if dlg.exec() == _QDialog.DialogCode.Accepted and dlg.output_path:
             self._on_json_loaded_for_preview(dlg.output_path)

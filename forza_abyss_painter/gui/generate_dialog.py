@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from forza_abyss_painter.gui.gpu_gen_worker import GpuGenWorker, build_run_config
+from forza_abyss_painter.gui.gpu_preflight import gpu_run_preflight
 from forza_abyss_painter.runtime.nvidia_smi import probe_free_vram
 from forza_abyss_painter.runtime.torch_installer import embedded_python_exe
 from forza_abyss_painter.shapegen.gpu.vram_planner import (
@@ -81,7 +82,12 @@ class GenerateLocallyDialog(QDialog):
     return path to generated JSON via `self.output_path` after Accepted.
     """
 
-    def __init__(self, parent=None, initial_source_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        parent=None,
+        initial_source_path: Path | None = None,
+        gpu_budget_gib: float = 24.0,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Generate shapes locally (GPU)")
         self.setModal(True)
@@ -90,6 +96,15 @@ class GenerateLocallyDialog(QDialog):
         self.source_path: Path | None = None
         self.output_path: Path | None = None     # set on successful run
         self._selected_preset_idx = 0            # default: Lineart
+        # VRAM budget for the preflight gate. Caller passes the value from
+        # SettingsPanel.selected_vram_budget_gib() so the gate knows how
+        # tight the card is. Default 24.0 keeps headless tests working;
+        # the real call site in main_window overrides it.
+        self._gpu_budget_gib: float = float(gpu_budget_gib)
+        # Effective max_resolution override — set by _on_generate_clicked
+        # AFTER preflight returns with a lowered value. .values() returns
+        # this when set so build_run_config sees the right number.
+        self._effective_max_resolution: int | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 16, 20, 16)
@@ -327,6 +342,18 @@ class GenerateLocallyDialog(QDialog):
         )
         self.vram_info.setTextFormat(Qt.RichText)
 
+    def values(self) -> dict:
+        """Return the effective preset dict for the currently selected
+        item. Honors any `_effective_max_resolution` override set by the
+        preflight gate (lower-and-confirm path)."""
+        preset = self.preset_combo.currentData()
+        if preset is None:
+            return {}
+        out = dict(preset)
+        if self._effective_max_resolution is not None:
+            out["max_resolution"] = int(self._effective_max_resolution)
+        return out
+
     def _on_generate_clicked(self) -> None:
         """Lock the form, spawn the GPU subprocess via GpuGenWorker on a
         QThread, route its IPC events through Qt signals to update the
@@ -337,7 +364,26 @@ class GenerateLocallyDialog(QDialog):
         """
         if not self.source_path:
             return
-        preset = self.preset_combo.currentData()
+        # Centralized 3-tier preflight + back-prop modal (Correction
+        # Task 5). Closes the bypass: before this wire-up the dialog
+        # spawned the worker directly without a VRAM check. Now we
+        # gate on the helper's verdict — block returns early, lower
+        # path stashes the effective max_resolution into the override
+        # so .values() / build_run_config see it.
+        preset_baked = self.preset_combo.currentData()
+        proceed, effective_preset = gpu_run_preflight(
+            parent=self,
+            preset=preset_baked,
+            budget_gib=float(self._gpu_budget_gib),
+            context="Generate locally",
+        )
+        if not proceed:
+            return
+        # Stash the effective max_resolution so subsequent .values() calls
+        # (and the build_run_config below) reflect the lowered/autotuned
+        # value — never the baked one when they differ.
+        self._effective_max_resolution = int(effective_preset["max_resolution"])
+        preset = self.values()
         out_path = self._resolve_output_path(preset)
 
         # Write the IPC config alongside the source image so it's easy
@@ -494,17 +540,23 @@ class GenerateLocallyDialog(QDialog):
             self._worker.cancel()
 
 
-def open_generate_dialog_if_runtime_ready(parent) -> Path | None:
+def open_generate_dialog_if_runtime_ready(
+    parent, gpu_budget_gib: float = 24.0,
+) -> Path | None:
     """Convenience entry point used by the Tools menu. Checks runtime is
     installed; if not, prompts the install flow; if so (or after install
     completes), opens the generate dialog. Returns the generated JSON
-    path on success, None on cancel/skip."""
+    path on success, None on cancel/skip.
+
+    `gpu_budget_gib` flows through to the dialog so the preflight gate
+    knows how tight the card is.
+    """
     from forza_abyss_painter.gui.runtime_install_dialog import (
         prompt_install_or_use_existing,
     )
     if not prompt_install_or_use_existing(parent):
         return None
-    dlg = GenerateLocallyDialog(parent)
+    dlg = GenerateLocallyDialog(parent, gpu_budget_gib=gpu_budget_gib)
     if dlg.exec() == QDialog.Accepted and dlg.output_path:
         return dlg.output_path
     return None
