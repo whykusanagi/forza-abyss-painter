@@ -118,7 +118,7 @@ def test_snapshot_render_module_is_top_level_import():
     import ast
     src = Path(
         "forza_abyss_painter/gui/main_window.py"
-    ).read_text()
+    ).read_text(encoding="utf-8")
     tree = ast.parse(src)
     top_level_imports = []
     for node in tree.body:
