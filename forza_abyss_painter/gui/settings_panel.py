@@ -29,11 +29,83 @@ class SettingsPanel(QWidget):
     pause_clicked = Signal()
     stop_clicked = Signal()
     inject_clicked = Signal()
+    backend_changed = Signal(str)   # "cpu" or "gpu"
+    gpu_install_requested = Signal()  # user picked GPU but it's not installed
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
+
+        # Generation backend selector — front-and-center so users SEE
+        # that GPU is an option without having to discover it in the
+        # Tools menu. The label text updates dynamically to reflect
+        # install state so users know whether GPU is ready to use or
+        # needs a one-time install first. Without this row, GPU was a
+        # hidden feature 95% of users never found.
+        backend_row = QHBoxLayout()
+        backend_label = QLabel("Generate using:")
+        backend_label.setToolTip(
+            "CPU runs the built-in shape generator (always available, slower). "
+            "GPU runs the CUDA-accelerated generator in an isolated subprocess "
+            "(5-30x faster, requires a one-time ~4 GiB runtime download on first "
+            "use). The label updates to show your current GPU runtime state."
+        )
+        backend_row.addWidget(backend_label)
+        self.backend_combo = QComboBox(self)
+        self.backend_combo.setToolTip(backend_label.toolTip())
+        # Indexes pin the values (currentData would be cleaner but the
+        # rest of the file uses currentIndex pattern; stay consistent).
+        self.backend_combo.addItem("CPU (built-in)", userData="cpu")
+        self.backend_combo.addItem("GPU (loading…)", userData="gpu")
+        self.backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+        backend_row.addWidget(self.backend_combo, stretch=1)
+        layout.addLayout(backend_row)
+        # Populate the GPU label based on current install state.
+        self._refresh_gpu_backend_label()
+
+        # VRAM budget selector — only meaningful when GPU is the chosen
+        # backend, but always visible so the user understands it exists
+        # before they switch. Tester reported the GPU run was eating
+        # all available VRAM and starving FH6 / Discord / other apps;
+        # this gives them a knob to cap usage. Ports the colab
+        # CELL_RESOLUTION_PLANNER (build_colab_notebook.py:287-372)
+        # peak-VRAM formula so the EXE warns BEFORE Start when current
+        # settings would blow the budget.
+        vram_row = QHBoxLayout()
+        vram_label = QLabel("GPU VRAM budget:")
+        vram_label.setToolTip(
+            "How much VRAM the GPU shape-gen is allowed to use. Pick "
+            "lower budgets when you're running FH6 / Discord / other "
+            "GPU apps in parallel so they don't get starved. The app "
+            "computes peak VRAM from your current settings + warns "
+            "before Start if you'd exceed the budget. Auto = use 80% "
+            "of free VRAM (recommended unless you want explicit "
+            "headroom for other apps)."
+        )
+        vram_row.addWidget(vram_label)
+        self.vram_budget_combo = QComboBox(self)
+        self.vram_budget_combo.setToolTip(vram_label.toolTip())
+        # Budget options (label, GiB value or 0 for auto). Spans
+        # gaming-card range (8 GiB minimum modern card) to RTX 5090
+        # (32 GiB). 'Auto' resolves to 80% of detected free VRAM at
+        # Start time.
+        for label, gib in (
+            ("Auto (80% of free VRAM)", 0),
+            ("4 GiB — light (FH6 + other apps active)", 4),
+            ("6 GiB — moderate", 6),
+            ("8 GiB — standard gaming card", 8),
+            ("12 GiB — RTX 3060/4070 class", 12),
+            ("16 GiB — RTX 4080 class", 16),
+            ("24 GiB — RTX 4090 class", 24),
+            ("32 GiB — RTX 5090 class", 32),
+        ):
+            self.vram_budget_combo.addItem(label, userData=gib)
+        # Default to Auto so users don't have to guess; explicit pick
+        # is for the "I have FH6 + Discord open" scenario.
+        self.vram_budget_combo.setCurrentIndex(0)
+        vram_row.addWidget(self.vram_budget_combo, stretch=1)
+        layout.addLayout(vram_row)
 
         # Profile picker
         prof_row = QHBoxLayout()
@@ -92,12 +164,15 @@ class SettingsPanel(QWidget):
             "override this if you want to free up cores for something else "
             "while generation runs (e.g. set it to half your core count)."
         )
-        self.preview_every = QSpinBox(); self.preview_every.setRange(1, 100); self.preview_every.setValue(1)
+        self.preview_every = QSpinBox(); self.preview_every.setRange(1, 100); self.preview_every.setValue(50)
         self.preview_every.setToolTip(
             "How often to refresh the live preview pane during generation. "
-            "1 = redraw after every shape (smoothest, slight CPU cost). "
-            "10 = redraw every 10 shapes (faster, choppier). Doesn't affect "
-            "the final result, only what you see while it's running."
+            "50 = redraw every 50 shapes (default, matches the Colab "
+            "notebook cadence — good balance of feedback + speed). "
+            "Lower = smoother preview but slower generation. "
+            "1 = redraw after every shape (smoothest, slight cost). "
+            "Doesn't affect the final result, only what you see while "
+            "it's running."
         )
         # QFormLayout auto-creates QLabel widgets for the left column. Those
         # labels do NOT inherit tooltips from their paired field, so hovering
@@ -234,6 +309,106 @@ class SettingsPanel(QWidget):
 
         # Apply initial profile
         self._on_profile_changed(self.profile_combo.currentIndex())
+
+    def selected_vram_budget_gib(self) -> int:
+        """Return the user's chosen VRAM budget in GiB, or 0 for Auto.
+        Caller (main_window's _start_gpu) compares the estimated peak
+        against this + surfaces a warning if peak > budget * 0.85."""
+        data = self.vram_budget_combo.currentData()
+        return int(data) if data is not None else 0
+
+    def estimate_peak_vram_gib(self, profile) -> float:
+        """Return the chunk-aware EFFECTIVE peak that will actually be
+        allocated on the GPU at the user's selected VRAM budget.
+
+        Single source of truth: `vram_planner.estimate_effective_peak_gib`.
+        When chunking engages, this is the per-chunk peak (what the
+        engine actually allocates at scoring time), not the unchunked
+        full-K number. Method name is preserved for caller compatibility;
+        semantics align with what runs on the card.
+
+        Always assumes bbox_local=True (production EXE path; chunking
+        only applies to bbox_local scoring).
+        """
+        from forza_abyss_painter.shapegen.gpu.vram_planner import (
+            estimate_effective_peak_gib,
+        )
+        peak, _chunks = estimate_effective_peak_gib(
+            K=max(1, int(profile.random_samples)),
+            max_resolution=max(64, int(profile.max_resolution)),
+            budget_gib=float(self.selected_vram_budget_gib()),
+        )
+        return peak
+
+    def selected_backend(self) -> str:
+        """Return 'cpu' or 'gpu' — which shape-gen backend the user
+        picked. Main window's Start handler routes accordingly."""
+        data = self.backend_combo.currentData()
+        return str(data) if data else "cpu"
+
+    def refresh_backend_state(self) -> None:
+        """Public hook to re-poll the GPU runtime install state. Call
+        this after the install dialog closes so the dropdown label
+        updates immediately ('GPU (Install required…)' → 'GPU — RTX
+        4090')."""
+        self._refresh_gpu_backend_label()
+
+    def _refresh_gpu_backend_label(self) -> None:
+        """Sync the GPU dropdown entry's label with the actual runtime
+        state. Three states:
+          - flag disabled OR no marker:  'GPU (Install required…)'
+          - marker present, cuda False:  'GPU (install incomplete)'
+          - marker present, cuda True:   'GPU — {device name}'
+        """
+        from forza_abyss_painter.gui.feature_flags import GPU_PHASE_3_AVAILABLE
+        # Find the GPU row (we added it at index 1).
+        gpu_idx = -1
+        for i in range(self.backend_combo.count()):
+            if self.backend_combo.itemData(i) == "gpu":
+                gpu_idx = i
+                break
+        if gpu_idx < 0:
+            return
+        if not GPU_PHASE_3_AVAILABLE:
+            # Flag disabled = no GPU UI at all; remove the row entirely
+            # so the dropdown doesn't show a useless option.
+            self.backend_combo.removeItem(gpu_idx)
+            return
+        from forza_abyss_painter.runtime.torch_installer import (
+            installed_runtime_info,
+        )
+        info = installed_runtime_info()
+        if info is None:
+            label = "GPU (Install required…)"
+        elif not info.cuda_available:
+            label = "GPU (install incomplete — re-install)"
+        else:
+            device = info.cuda_device_name or "CUDA device"
+            label = f"GPU — {device}"
+        # blockSignals while editing so we don't fire backend_changed
+        # for a label-only update.
+        self.backend_combo.blockSignals(True)
+        self.backend_combo.setItemText(gpu_idx, label)
+        self.backend_combo.blockSignals(False)
+
+    def _on_backend_changed(self, _idx: int) -> None:
+        """User picked CPU or GPU. If they picked GPU but it's not
+        installed, emit gpu_install_requested so the main window opens
+        the install dialog. After the dialog closes, main_window calls
+        refresh_backend_state to update our label."""
+        backend = self.selected_backend()
+        if backend == "gpu":
+            from forza_abyss_painter.runtime.torch_installer import (
+                is_runtime_installed,
+            )
+            if not is_runtime_installed():
+                self.gpu_install_requested.emit()
+                # Don't auto-revert — let the user decide via the install
+                # dialog. If they cancel, _refresh_gpu_backend_label gets
+                # called from main_window and the label still says
+                # "Install required…", which makes it clear Start won't
+                # actually GPU-generate yet.
+        self.backend_changed.emit(backend)
 
     def selected_target_profile_key(self) -> str:
         """Return the key ('fh6'/'fh5'/'fh4') of the currently picked injection target."""

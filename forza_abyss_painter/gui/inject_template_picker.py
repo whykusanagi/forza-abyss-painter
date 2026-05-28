@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 # Common FH6 vinyl-group template sizes. These are the EXACT counts the
 # game's "Create Vinyl Group" templates offer. Anything off this list is
 # probably custom-built and goes through the Custom path.
-STANDARD_TEMPLATE_SIZES: tuple[int, ...] = (10, 20, 50, 100, 500, 1000, 1500, 3000)
+STANDARD_TEMPLATE_SIZES: tuple[int, ...] = (10, 20, 50, 100, 500, 1000, 1500, 1800, 3000)
 
 # Hard ceiling on custom values. FH6 won't accept > 3000 layers per group.
 CUSTOM_MIN = 1

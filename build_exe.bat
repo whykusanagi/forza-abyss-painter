@@ -5,6 +5,9 @@ REM Run from the repo root after `pip install -r requirements.txt`.
 setlocal
 cd /d "%~dp0"
 
+REM GPU runtime install copies shapegen/io/runtime as on-disk trees. Without
+REM --add-data below, onefile EXE only has those modules in PYZ; copy_package fails.
+
 pyinstaller ^
     --noconfirm ^
     --onefile ^
@@ -13,6 +16,10 @@ pyinstaller ^
     --icon "assets\forza_abyss_painter.ico" ^
     --add-data "forza_abyss_painter\settings\profiles;forza_abyss_painter\settings\profiles" ^
     --add-data "forza_abyss_painter\inject\patterns;forza_abyss_painter\inject\patterns" ^
+    --add-data "forza_abyss_painter\shapegen;forza_abyss_painter\shapegen" ^
+    --add-data "forza_abyss_painter\io;forza_abyss_painter\io" ^
+    --add-data "forza_abyss_painter\runtime;forza_abyss_painter\runtime" ^
+    --add-data "forza_abyss_painter\cli;forza_abyss_painter\cli" ^
     --add-data "SplashScreen.mp4;." ^
     --add-data "Song1OpenSource.mp3;." ^
     --add-data "Song2OpenSource.mp3;." ^

@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget, QLabel,
 )
 
+from forza_abyss_painter.gui import feature_flags
 from forza_abyss_painter.gui.widgets import DropZone
 from forza_abyss_painter.gui.widgets.drop_zone import SUPPORTED_EXTS
 # Note: forza_abyss_painter.gui.image_search is NOT imported at module load — that would force
@@ -20,6 +21,9 @@ class UploadPanel(QWidget):
     files_selected = Signal(list)        # list[Path] — image files chosen for generation
     json_loaded = Signal(Path)           # User uploaded a JSON: load + show preview (do NOT inject)
     download_json_requested = Signal()   # User wants to save the most-recent generated JSON
+    reshape_requested = Signal(Path)     # User wants to re-shape-gen using the loaded JSON's source image
+    polish_requested = Signal(Path)      # User wants to polish the loaded JSON in place
+    resume_requested = Signal(Path)      # User picked a snapshot to resume from
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -56,6 +60,45 @@ class UploadPanel(QWidget):
         json_row.addWidget(self.upload_json_btn)
         json_row.addWidget(self.download_json_btn)
         layout.addLayout(json_row)
+
+        # Re-shape-gen + Polish (#85 #86). Both hidden until a JSON is loaded
+        # AND the corresponding feature flag is True at set_json_loaded() time.
+        # IMPORTANT: placed BEFORE self.stack (stretch=1) so they are never
+        # pushed off-screen by the stack's vertical expansion.
+        self._loaded_json_path: Path | None = None
+        reshape_polish_row = QHBoxLayout()
+        self.reshape_btn = QPushButton("Re-shape-gen at higher budget…", self)
+        self.reshape_btn.setToolTip(
+            "Re-run shape-gen on the same source image at a higher shape "
+            "budget. Opens the Generate dialog pre-filled with the source "
+            "image from the loaded JSON."
+        )
+        self.reshape_btn.clicked.connect(self._on_reshape_clicked)
+        self.reshape_btn.setVisible(False)
+        self.polish_btn = QPushButton("Polish loaded JSON…", self)
+        self.polish_btn.setToolTip(
+            "Refine the colors of the shapes in the loaded JSON without "
+            "generating new geometry. Output is saved as "
+            "<input>_polished.json next to the loaded file."
+        )
+        self.polish_btn.clicked.connect(self._on_polish_clicked)
+        self.polish_btn.setVisible(False)
+        reshape_polish_row.addWidget(self.reshape_btn)
+        reshape_polish_row.addWidget(self.polish_btn)
+        layout.addLayout(reshape_polish_row)
+
+        # Resume from snapshot (#snapshot-resume). Always visible — failed
+        # runs are a day-one concern, no flag, no gate on loaded JSON.
+        resume_row = QHBoxLayout()
+        self.resume_btn = QPushButton("Resume from snapshot…", self)
+        self.resume_btn.setToolTip(
+            "Pick a partial snapshot (<name>_<count>.json) from a "
+            "failed or cancelled run and continue generation to the "
+            "original target shape count using the original settings."
+        )
+        self.resume_btn.clicked.connect(self._on_resume_clicked)
+        resume_row.addWidget(self.resume_btn)
+        layout.addLayout(resume_row)
 
         layout.addSpacing(4)
         # Label tracks which panel is showing — flips when Customizations
@@ -95,6 +138,34 @@ class UploadPanel(QWidget):
     def _on_downloaded_image(self, path: Path) -> None:
         # Feed the downloaded image through the same path as an Upload click
         self._emit([Path(path)])
+
+    def set_json_loaded(self, json_path: Path | None) -> None:
+        """Called by MainWindow after Upload JSON succeeds (path) or fails
+        (None). Toggles the Re-shape-gen + Polish buttons accordingly. Flag
+        values are read each call so tests can monkey-patch them; in
+        production they're build-time constants and the read is effectively
+        static."""
+        self._loaded_json_path = json_path
+        has_json = self._loaded_json_path is not None
+        self.reshape_btn.setVisible(has_json and feature_flags.RESHAPE_GEN_AVAILABLE)
+        self.polish_btn.setVisible(has_json and feature_flags.POLISH_LOADED_AVAILABLE)
+
+    def _on_reshape_clicked(self) -> None:
+        if self._loaded_json_path is not None:
+            self.reshape_requested.emit(self._loaded_json_path)
+
+    def _on_polish_clicked(self) -> None:
+        if self._loaded_json_path is not None:
+            self.polish_requested.emit(self._loaded_json_path)
+
+    def _on_resume_clicked(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Pick snapshot to resume",
+            "",
+            "Forza Abyss Painter snapshots (*_*.json);;All JSON (*.json);;All files (*)",
+        )
+        if path:
+            self.resume_requested.emit(Path(path))
 
     def _on_upload_clicked(self) -> None:
         exts = " ".join(f"*{e}" for e in sorted(SUPPORTED_EXTS))

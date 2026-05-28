@@ -77,7 +77,7 @@ if 'PySide6.QtWidgets' not in sys.modules:
 def test_picker_module_imports_with_stubbed_qt():
     """The picker module must import cleanly so its constants are usable."""
     from forza_abyss_painter.gui import inject_template_picker as picker_mod
-    assert picker_mod.STANDARD_TEMPLATE_SIZES == (10, 20, 50, 100, 500, 1000, 1500, 3000)
+    assert picker_mod.STANDARD_TEMPLATE_SIZES == (10, 20, 50, 100, 500, 1000, 1500, 1800, 3000)
     assert picker_mod.CUSTOM_MIN == 1
     assert picker_mod.CUSTOM_MAX == 3000
 

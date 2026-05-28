@@ -14,7 +14,7 @@ class Profile:
     max_threads: int = 0  # 0 = auto (os.cpu_count())
     mutated_samples: int = 200
     posterize_levels: int = 256
-    preview_every: int = 1
+    preview_every: int = 50
     random_samples: int = 1000
     redundant_check_every: int = 500
     save_at: list[int] = field(default_factory=lambda: [500, 1000, 1500, 2000, 2500, 3000])

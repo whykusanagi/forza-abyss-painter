@@ -33,12 +33,24 @@ def _bundle_root() -> Path:
 
 
 def badge_path(filename: str) -> Path | None:
-    """Return absolute path to a badge PNG, or None if missing. Bundle-aware."""
+    """Return absolute path to a badge PNG, or None if missing.
+
+    Search order:
+      1. <bundle_root>/<filename>     — most themed badges (Pink.png etc.)
+      2. <bundle_root>/assets/<filename>  — new whyKusanagi-branded logo
+      3. Legacy fallbacks (FD6 upstream era) — should only fire for
+         dev environments that haven't pulled the new assets/.
+    """
     root = _bundle_root()
     p = root / filename
     if p.exists():
         return p
-    # Legacy fallbacks
+    # New whyKusanagi assets/ directory (forza_abyss_painter_logo.png lives here).
+    p = root / "assets" / filename
+    if p.exists():
+        return p
+    # Legacy fallbacks — keep so a dev env without the new assets/ still boots,
+    # but these should never fire in production builds.
     for cand in (root / "tools" / "fd6_128.png", root / "Logo.png"):
         if cand.exists():
             return cand

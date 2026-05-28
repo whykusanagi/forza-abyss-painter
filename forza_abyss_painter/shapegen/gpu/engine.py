@@ -8,9 +8,13 @@ import torch
 
 from forza_abyss_painter.shapegen.gpu.device import DTYPE, get_device
 from forza_abyss_painter.shapegen.gpu.rasterize import rasterize_rotated_ellipses
-from forza_abyss_painter.shapegen.gpu.scoring import ALPHA_FIXED, score_batch
+from forza_abyss_painter.shapegen.gpu.scoring import (
+    ALPHA_FIXED, score_batch, score_batch_chunked,
+)
 from forza_abyss_painter.shapegen.gpu.shapes_gpu import KINDS, ShapeKind
-from forza_abyss_painter.shapegen.gpu.bbox_score import crop_score_ellipse_batch
+from forza_abyss_painter.shapegen.gpu.bbox_score import (
+    crop_score_ellipse_batch, crop_score_ellipse_batch_chunked,
+)
 from forza_abyss_painter.shapegen.gpu.joint_polish import joint_polish
 
 
@@ -143,6 +147,29 @@ class GPUConfig:
     grad_starts: int = 16
     grad_steps: int = 50
     grad_lr: float = 2.0
+    # VRAM budget in GiB. 0 = no budget = run the full K-batch in one
+    # pass (original behavior). >0 = enable chunked-K mode: split the
+    # K candidates into VRAM-safe sub-batches and score each
+    # independently, then merge. Wall time scales roughly linearly with
+    # the chunk count; peak VRAM is bounded by the budget. Lets users
+    # set "12 GiB budget, 3000 shapes, 1200px" and have it run in 4
+    # chunks instead of refusing to start. See _resolve_k_chunk_size
+    # for the derivation.
+    vram_budget_gib: float = 0.0
+    # Explicit chunk-size override (mostly for tests). 0 = auto-derive
+    # from vram_budget_gib. >0 = force this chunk size regardless of
+    # budget. Useful when the budget calculation under/over-estimates
+    # for an unusual canvas geometry.
+    k_chunk_size: int = 0
+
+
+# Re-export the pure-Python chunk size resolver from vram_planner so
+# engine callers can use either qualified name. The torch-free module
+# is the single source of truth for the formula; this alias keeps
+# existing engine-internal imports working.
+from forza_abyss_painter.shapegen.gpu.vram_planner import (
+    resolve_k_chunk_size as _resolve_k_chunk_size,
+)
 
 
 def _random_params(K: int, w: int, h: int, gen: torch.Generator) -> torch.Tensor:
@@ -325,6 +352,66 @@ def _refine_gradient(kind: ShapeKind, init_params, canvas_u8, target_u8, alpha_t
             float(scores[best].cpu().item()))
 
 
+def _scale_seed_shapes(
+    shapes: "list[dict]",
+    *,
+    snap: tuple[int, int],
+    target: tuple[int, int],
+) -> "list[dict]":
+    """Scale (x, y, rx, ry) by target/snap ratio for canvas resize on resume.
+
+    Resume from a snapshot captured at canvas dims `snap` onto a smaller
+    (or larger) canvas `target` needs each seeded shape's geometry
+    rescaled — otherwise the composite paints at the original pixel
+    coordinates, which on a smaller target either falls off-canvas or
+    leaves a tiny island in one corner. The ResumeDialog (Task 8) calls
+    this when it detects a canvas-size mismatch + the user opts to lower
+    max_resolution to fit a tighter VRAM budget.
+
+    Color and angle are dimensionless and preserved verbatim. Both
+    snake_case shape fields (``"color"`` from fd6.shapes) and the
+    test-only ``"rgba"`` alias are left untouched along with any other
+    non-geometric metadata.
+
+    `snap` and `target` are both (W, H) tuples — same convention as
+    Qt/PIL widget sizes.
+
+    Raises:
+        ValueError: if min scale < 0.3x or max scale > 3.0x in either
+            axis. Beyond that range the rescaled shapes are either too
+            sub-pixel to render meaningfully or stretched far enough
+            that the seeded RMS gain over a fresh run vanishes — the
+            user is better off starting clean than burning compute on
+            unusable seeds.
+    """
+    sw, sh = snap
+    tw, th = target
+    if sw == tw and sh == th:
+        return shapes
+
+    fx = tw / sw
+    fy = th / sh
+    if min(fx, fy) < 0.3 or max(fx, fy) > 3.0:
+        raise ValueError(
+            f"scale factor too extreme: snap={snap} target={target} "
+            f"({fx:.2f}x, {fy:.2f}x); refusing to resize seeded shapes"
+        )
+
+    out: "list[dict]" = []
+    for s in shapes:
+        scaled = dict(s)
+        if "x" in scaled:
+            scaled["x"] = float(scaled["x"]) * fx
+        if "y" in scaled:
+            scaled["y"] = float(scaled["y"]) * fy
+        if "rx" in scaled:
+            scaled["rx"] = float(scaled["rx"]) * fx
+        if "ry" in scaled:
+            scaled["ry"] = float(scaled["ry"]) * fy
+        out.append(scaled)
+    return out
+
+
 def run_gpu(
     target_rgb: np.ndarray,
     cfg: GPUConfig,
@@ -332,6 +419,9 @@ def run_gpu(
     progress_every: int = 0,
     checkpoint_cb=None,
     checkpoint_every: int = 0,
+    seed_shapes: "list[dict] | None" = None,
+    *,
+    seed_canvas_size: "tuple[int, int] | None" = None,
 ) -> tuple[list[dict], np.ndarray]:
     """Public entry point — wraps `_run_gpu_inner` with CUDA OOM recovery.
 
@@ -346,12 +436,24 @@ def run_gpu(
     Critical for the consumer-GPU notebook variants where the VRAM probe
     can underestimate peak usage when FH6 is running concurrently and its
     VRAM consumption fluctuates mid-shape-gen.
+
+    If `seed_shapes` is provided, each shape is replayed onto the canvas
+    before the greedy loop, so the loop generates only
+    (cfg.num_shapes - len(seed_shapes)) new shapes.
+
+    If `seed_canvas_size` is provided AND differs from the current
+    target canvas dims, `seed_shapes` are rescaled via
+    `_scale_seed_shapes` before replay — needed for resume on a tighter
+    card than the snapshot. Default `None` preserves identical behavior
+    for fresh runs + resume-without-resize.
     """
     try:
         return _run_gpu_inner(target_rgb, cfg, alpha_mask=alpha_mask,
                               progress_every=progress_every,
                               checkpoint_cb=checkpoint_cb,
-                              checkpoint_every=checkpoint_every)
+                              checkpoint_every=checkpoint_every,
+                              seed_shapes=seed_shapes,
+                              seed_canvas_size=seed_canvas_size)
     except torch.cuda.OutOfMemoryError as e:
         # Drop the cached allocator state so a follow-up attempt with
         # lower settings doesn't inherit this run's high-water mark.
@@ -388,6 +490,9 @@ def _run_gpu_inner(
     progress_every: int = 0,
     checkpoint_cb=None,
     checkpoint_every: int = 0,
+    seed_shapes: "list[dict] | None" = None,
+    *,
+    seed_canvas_size: "tuple[int, int] | None" = None,
 ) -> tuple[list[dict], np.ndarray]:
     """Run the GPU shape-gen loop. Returns (shapes_as_json_dicts, final_canvas_u8_numpy).
 
@@ -458,6 +563,54 @@ def _run_gpu_inner(
     use_bbox = (cfg.bbox_local and cfg.refine_mode == "gradient"
                 and len(kinds) == 1 and kinds[0].name == "rotated_ellipse")
 
+    # Loud warning when we're about to take the full_canvas path with
+    # a K large enough to OOM rasterize_hard. Cursor's QUASAR step-
+    # trace caught this on a 32 GiB card: K=8192 + 720px → (K, H, W)
+    # float32 = ~16 GiB monolithic alloc inside rasterize_hard, BEFORE
+    # the chunked scorer even runs. Chunking is only wired for scoring
+    # (not for the up-front rasterize) so the user's vram_budget can't
+    # save them. Strategy-B chunked rasterize is #129; until that
+    # lands, this warning is the canary.
+    if not use_bbox and cfg.random_samples > 1024:
+        import sys as _sys
+        print(
+            f"[WARN] use_bbox=False with K={cfg.random_samples} — "
+            f"engine will allocate a (K, {h}, {w}) ≈ "
+            f"{cfg.random_samples * h * w * 4 / 1e9:.1f} GiB mask "
+            f"tensor inside rasterize_hard BEFORE chunked scoring "
+            f"engages. This OOMs on consumer GPUs. Set bbox_local=True "
+            f"for ellipse-only runs (the EXE production path), or drop "
+            f"random_samples ≤ 1024 for full_canvas. Chunked rasterize "
+            f"is the proper fix (#129) but not yet wired.",
+            file=_sys.stderr, flush=True,
+        )
+
+    # Resolve the chunked-K mini-batch size ONCE up front. Used by every
+    # call to crop_score_ellipse_batch_chunked / score_batch_chunked
+    # below. 0 = no chunking (full K-batch in one pass, original
+    # behavior). >0 = split into chunks of this size. See
+    # _resolve_k_chunk_size docstring + GPUConfig.vram_budget_gib /
+    # k_chunk_size docs for the derivation.
+    _k_chunk = _resolve_k_chunk_size(
+        K=cfg.random_samples,
+        bbox_local=use_bbox,
+        max_resolution=max(int(h), int(w)),
+        vram_budget_gib=cfg.vram_budget_gib,
+        k_chunk_override=cfg.k_chunk_size,
+        bbox_crop_max=cfg.bbox_crop_max,
+    )
+    if _k_chunk > 0:
+        n_chunks = (cfg.random_samples + _k_chunk - 1) // _k_chunk
+        # stderr (not stdout) so the activation shows up in the IPC
+        # capture stream — Cursor's smoke missed this line because
+        # print() defaults to stdout, which torch_runner's caller
+        # doesn't tee. Failing to log this silently lost the signal
+        # that chunked-K was (or wasn't) engaging on a 47.5-GiB OOM.
+        import sys as _sys
+        print(f"[chunked-K] K={cfg.random_samples}, chunk_size={_k_chunk}, "
+              f"n_chunks={n_chunks}, budget={cfg.vram_budget_gib:.1f} GiB",
+              file=_sys.stderr, flush=True)
+
     if alpha_mask is not None:
         # Fill out-of-silhouette target pixels with the canvas substrate color (grey 40).
         # Rationale: in-game and CPU renderers paint every shape's full ellipse unclipped —
@@ -501,6 +654,53 @@ def _run_gpu_inner(
     consecutive_skips = 0
     shape_idx = 0
     t_start = time.perf_counter()
+
+    # Resume support (#snapshot-resume): when seed_shapes is provided,
+    # replay each onto canvas + append to the shapes list. Greedy loop
+    # then starts at len(seeded) and continues to cfg.num_shapes. The
+    # randomness state is unaffected — only the canvas + shapes list
+    # change. Polish + refill run at end as usual on the FULL set.
+    #
+    # Canvas-size mismatch (resume on a tighter card): when the caller
+    # passes seed_canvas_size and it differs from the current (w, h),
+    # rescale shape geometry via _scale_seed_shapes before replay so
+    # composites land on the new canvas instead of being clipped or
+    # squashed into a corner. The helper refuses extreme ratios; let
+    # that propagate so the user gets a clear error rather than a
+    # silently unusable resume.
+    if seed_shapes and seed_canvas_size is not None:
+        target_canvas = (int(w), int(h))
+        if seed_canvas_size != target_canvas:
+            seed_shapes = _scale_seed_shapes(
+                seed_shapes,
+                snap=seed_canvas_size,
+                target=target_canvas,
+            )
+    if seed_shapes:
+        ellipse_kind = KINDS["rotated_ellipse"]
+        for s in seed_shapes:
+            if s.get("type") != "rotated_ellipse":
+                # Defensive: caller should have rejected upstream
+                # (runner branch validates). If we get here, fail
+                # loud rather than corrupting canvas state.
+                raise ValueError(
+                    f"seed_shapes contains non-ellipse type "
+                    f"{s.get('type')!r}; resume currently supports "
+                    f"rotated_ellipse only"
+                )
+            params = torch.tensor(
+                [s["x"], s["y"], s["rx"], s["ry"], s["angle"]],
+                dtype=DTYPE, device=device,
+            )
+            color = torch.tensor(s["color"][:3], dtype=DTYPE, device=device)
+            alpha_val = int(s["color"][3])
+            canvas = _composite_one(
+                ellipse_kind,
+                canvas, params, color, h, w, alpha_mask_f, alpha_val,
+            )
+            shapes.append(dict(s))   # copy to avoid caller mutation
+        shape_idx = len(shapes)
+
     per_kind = max(1, cfg.random_samples // len(kinds))
     while shape_idx < cfg.num_shapes:
         # 1) Random search across all candidate kinds; keep each kind's best seed.
@@ -519,9 +719,10 @@ def _run_gpu_inner(
             # by the gradient refiner below.
             ekind = kinds[0]
             params = ekind.init(cfg.random_samples, w, h, gen).to(device)
-            scores, colors, alphas = crop_score_ellipse_batch(
+            scores, colors, alphas = crop_score_ellipse_batch_chunked(
                 params, canvas, target, alpha_t=alpha_t, edge_weight=edge_weight,
-                alpha_levels=cfg.alpha_levels, max_crop_radius=cfg.bbox_crop_max)
+                alpha_levels=cfg.alpha_levels, max_crop_radius=cfg.bbox_crop_max,
+                chunk_size=_k_chunk)
             idx_t = scores.argmin()
             best_score = float(scores[idx_t].cpu().item())
             if best_score != float("inf"):
@@ -536,9 +737,11 @@ def _run_gpu_inner(
             for kind in kinds:
                 params = kind.init(per_kind, w, h, gen).to(device)
                 masks = kind.rasterize_hard(params, h, w)
-                scores, colors, alphas = score_batch(masks, canvas, target, alpha_mask=alpha_t,
-                                                     alpha_levels=cfg.alpha_levels,
-                                                     edge_weight=edge_weight)
+                scores, colors, alphas = score_batch_chunked(
+                    masks, canvas, target, alpha_mask=alpha_t,
+                    alpha_levels=cfg.alpha_levels,
+                    edge_weight=edge_weight,
+                    chunk_size=_k_chunk)
                 idx_t = scores.argmin()
                 val = float(scores[idx_t].cpu().item())
                 if val < best_score:
@@ -581,9 +784,11 @@ def _run_gpu_inner(
                 mut_cpu = _mutate(best_params.cpu(), cfg.mutations_per_round, w, h, gen)
                 mut = mut_cpu.to(device)
                 mut_masks = rasterize_rotated_ellipses(mut, h, w)
-                mut_scores, mut_colors, mut_alphas = score_batch(
-                    mut_masks, canvas, target, alpha_mask=alpha_t, alpha_levels=cfg.alpha_levels,
-                    edge_weight=edge_weight)
+                mut_scores, mut_colors, mut_alphas = score_batch_chunked(
+                    mut_masks, canvas, target, alpha_mask=alpha_t,
+                    alpha_levels=cfg.alpha_levels,
+                    edge_weight=edge_weight,
+                    chunk_size=_k_chunk)
                 local_best_t = mut_scores.argmin()
                 local_best_score = float(mut_scores[local_best_t].cpu().item())
                 if local_best_score < best_score:

@@ -1,26 +1,48 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
-    QHBoxLayout, QMainWindow, QMessageBox, QSplitter, QStackedWidget, QStatusBar, QVBoxLayout, QWidget
+    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QSplitter, QStackedWidget, QStatusBar, QVBoxLayout, QWidget
 )
 
 from forza_abyss_painter.gui.ac_settings_panel import ACSettingsPanel
 from forza_abyss_painter.gui.brand_banner import BrandBanner, badge_path
 from forza_abyss_painter.gui.game_suite_dialog import GameSuiteDialog
+from forza_abyss_painter.gui.gpu_gen_worker import (
+    GpuGenWorker, build_polish_config, build_run_config,
+)
+from forza_abyss_painter.gui.gpu_preflight import gpu_run_preflight
 from forza_abyss_painter.gui.preview_panel import PreviewPanel
 from forza_abyss_painter.gui.texture_preview_panel import TexturePreviewPanel
 from forza_abyss_painter.gui.themes import THEMES, apply_theme, saved_theme_name, badge_filename_for_theme
 from forza_abyss_painter.gui.queue_panel import QueuePanel
 from forza_abyss_painter.gui.settings_panel import SettingsPanel
+from forza_abyss_painter.gui.snapshot_render import _RenderSnapshotJob
 from forza_abyss_painter.gui.upload_panel import UploadPanel
 from forza_abyss_painter.shapegen.profile import Profile
 from forza_abyss_painter.shapegen.worker import GenerationWorker
 from forza_abyss_painter.inject.fh6_injector import patterns_are_populated, FH6_TARGET_BUILD
 from forza_abyss_painter.suite import SuiteMode, SUITE_DISPLAY, saved_suite_mode, save_suite_mode
+from forza_abyss_painter.runtime.nvidia_smi import probe_free_vram, ProbeResult
+
+
+def _resolve_source_image_path(json_path: Path, source_image_name: str) -> Path | None:
+    """Resolve the source image for a loaded JSON via the same-folder
+    heuristic. `source_image_name` is the JSON's `source_image` field
+    (canonically a bare filename); if it accidentally contains path
+    separators we use only the basename for safety. Returns the path
+    if the sibling exists, otherwise None — caller falls back to a
+    file picker.
+    """
+    if not source_image_name:
+        return None
+    bare = Path(source_image_name).name   # strip any embedded path
+    candidate = json_path.parent / bare
+    return candidate if candidate.is_file() else None
 
 
 class MainWindow(QMainWindow):
@@ -29,6 +51,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Forza Abyss Painter — Inject custom decals and vinyls into various racing titles")
         self.resize(1280, 760)
         self.setStatusBar(QStatusBar(self))
+        # Permanent GPU status indicator on the right side of the status
+        # bar — always visible, always reflects current install state.
+        # Refreshed after the install dialog closes + on construction.
+        # See _refresh_gpu_status_indicator for the state machine.
+        self._gpu_status_label = QLabel("")
+        self._gpu_status_label.setStyleSheet(
+            "padding: 0 8px; color: #888; font-size: 11px;"
+        )
+        self.statusBar().addPermanentWidget(self._gpu_status_label)
         self._apply_dark_palette()
 
         # Suite mode — read persisted choice; default Forza on first launch.
@@ -72,11 +103,21 @@ class MainWindow(QMainWindow):
         # Wire signals — Forza paths (unchanged)
         self.upload.files_selected.connect(self._on_files_selected)
         self.upload.json_loaded.connect(self._on_json_loaded_for_preview)
+        self.upload.reshape_requested.connect(self._on_reshape_requested)
+        self.upload.polish_requested.connect(self._on_polish_requested)
+        self.upload.resume_requested.connect(self._on_resume_requested)
         self.upload.download_json_requested.connect(self._on_download_json)
         self.settings_panel.start_clicked.connect(self._start_next)
         self.settings_panel.pause_clicked.connect(self._toggle_pause)
         self.settings_panel.stop_clicked.connect(self._stop_current)
         self.settings_panel.inject_clicked.connect(self._on_inject_clicked)
+        # Backend selector: if user picks GPU but it's not installed,
+        # auto-open the install dialog. After it closes (success or
+        # cancel), refresh the dropdown label so the user sees the new
+        # state immediately.
+        self.settings_panel.gpu_install_requested.connect(
+            self._on_gpu_install_requested
+        )
         # AC path
         self.ac_settings.export_clicked.connect(self._on_ac_export_clicked)
 
@@ -87,6 +128,15 @@ class MainWindow(QMainWindow):
         self._current_profile: Profile | None = None
         self._last_finished_json: Path | None = None  # tracks most recent completed run for Download button
         self._loaded_json_path: Path | None = None    # JSON loaded via Upload JSON (ready to inject)
+        # Single-slot render throttle for snapshot previews dispatched via
+        # _on_gpu_snapshot. If a _RenderSnapshotJob is already in flight,
+        # remember the latest snapshot path here; QTimer drain picks it up.
+        self._snapshot_render_in_flight: bool = False
+        self._snapshot_pending_path: str | None = None
+        # Cached validation issues from the last auto-validate on Upload
+        # JSON. Re-shown by Tools → Validate current JSON without
+        # re-reading the file. None until the first successful load.
+        self._loaded_json_issues: list | None = None
         self._inject_worker = None  # InjectionWorker (set when injecting)
         self._inject_thread: QThread | None = None
 
@@ -155,6 +205,60 @@ class MainWindow(QMainWindow):
             for act in self._music_vol_group.actions():
                 act.setEnabled(False)
 
+        # Initial population of the GPU status indicator. Reads
+        # is_runtime_installed() + the install marker if present;
+        # post-install refreshes from _on_install_gpu_runtime.
+        self._refresh_gpu_status_indicator()
+
+    def _refresh_gpu_status_indicator(self) -> None:
+        """Update the permanent status-bar GPU label based on current
+        install state. Called at construction time + every time the
+        install dialog closes so the user sees state transitions
+        without needing to restart the EXE.
+
+        State machine:
+          - GPU_PHASE_3_AVAILABLE=False → label hidden (no GPU UX yet)
+          - Marker missing                → "GPU: not installed"
+          - Marker present, cuda False    → "GPU: install incomplete"
+          - Marker present, cuda True     → "GPU: ready ({device})"
+        """
+        from forza_abyss_painter.gui.feature_flags import GPU_PHASE_3_AVAILABLE
+        if not GPU_PHASE_3_AVAILABLE:
+            self._gpu_status_label.setVisible(False)
+            return
+        self._gpu_status_label.setVisible(True)
+        from forza_abyss_painter.runtime.torch_installer import (
+            installed_runtime_info, is_runtime_installed,
+        )
+        info = installed_runtime_info()
+        if info is None:
+            self._gpu_status_label.setText("GPU: not installed")
+            self._gpu_status_label.setStyleSheet(
+                "padding: 0 8px; color: #888; font-size: 11px;"
+            )
+        elif not info.cuda_available:
+            self._gpu_status_label.setText("GPU: install incomplete (CPU-only torch)")
+            self._gpu_status_label.setStyleSheet(
+                "padding: 0 8px; color: #c97a4f; font-size: 11px;"
+            )
+        else:
+            device = info.cuda_device_name or "CUDA device"
+            # Append live free-VRAM if nvidia-smi works on this box.
+            # Cheap call — cached for 5s so the status bar can refresh
+            # frequently without spawning subprocesses. Falls back to
+            # the plain "ready" string when nvidia-smi is unavailable.
+            probe = probe_free_vram()
+            if probe.available and probe.free_gib is not None and probe.total_gib is not None:
+                vram_suffix = (
+                    f"  •  {probe.free_gib:.1f} / {probe.total_gib:.1f} GiB free"
+                )
+            else:
+                vram_suffix = ""
+            self._gpu_status_label.setText(f"GPU: ready — {device}{vram_suffix}")
+            self._gpu_status_label.setStyleSheet(
+                "padding: 0 8px; color: #6fbf73; font-size: 11px;"
+            )
+
     def start_music(self) -> None:
         """Begin background music. Call once, after the splash has finished, to
         avoid two QMediaPlayer audio streams colliding during splash teardown."""
@@ -188,18 +292,76 @@ class MainWindow(QMainWindow):
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
 
-        # ---- Tools menu — local GPU shape-gen entry point.
-        # First click triggers the runtime-install prompt (~4 GiB one-time
-        # download). Subsequent clicks open the Generate dialog directly.
-        # See forza_abyss_painter/runtime/ + gui/generate_dialog.py.
+        # ---- Tools menu ----
+        #
+        # GPU entries are gated behind GPU_PHASE_3_AVAILABLE. The flag
+        # is True once the install + generate plumbing is real (tasks
+        # #93-#96 + #102-#104 logging/diagnostics). See feature_flags.py.
+        from forza_abyss_painter.gui.feature_flags import GPU_PHASE_3_AVAILABLE
         tools_menu = mbar.addMenu("&Tools")
-        generate_act = QAction("&Generate shapes locally (GPU)…", self)
-        generate_act.setStatusTip(
-            "Run the GPU shape-generator on your local CUDA card "
-            "(requires one-time ~4 GiB runtime download)"
+        if GPU_PHASE_3_AVAILABLE:
+            # Install runtime — direct entry point. Users can pre-install
+            # without going through Generate, and re-install if their
+            # marker shows partial (cuda_available=False) state.
+            install_act = QAction("&Install GPU runtime…", self)
+            install_act.setStatusTip(
+                "Download and install the local GPU shape-gen runtime "
+                "(~4 GiB; one-time)"
+            )
+            install_act.triggered.connect(self._on_install_gpu_runtime)
+            tools_menu.addAction(install_act)
+            # Generate — the workflow entry point. If runtime isn't yet
+            # installed, this also prompts for install before showing
+            # the Generate dialog.
+            generate_act = QAction("&Generate shapes locally (GPU)…", self)
+            generate_act.setStatusTip(
+                "Run the GPU shape-generator on your local CUDA card "
+                "(requires one-time ~4 GiB runtime download)"
+            )
+            generate_act.triggered.connect(self._on_generate_locally)
+            tools_menu.addAction(generate_act)
+            tools_menu.addSeparator()
+
+        # One-click fap-clean: load a JSON, strip padding-whites + dead
+        # weight, save the cleaned file. Same library function the CLI
+        # uses; this is purely a UX surface for users who don't want to
+        # drop to a terminal.
+        clean_act = QAction("&Clean current JSON…", self)
+        clean_act.setStatusTip(
+            "Strip padding-white + fully-occluded shapes from a JSON "
+            "(same cleanup as the fap-clean CLI)"
         )
-        generate_act.triggered.connect(self._on_generate_locally)
-        tools_menu.addAction(generate_act)
+        clean_act.triggered.connect(self._on_clean_json)
+        tools_menu.addAction(clean_act)
+
+        # Validate currently-loaded JSON against fd6.shapes v1 spec.
+        # Surfaces issues that would silently break the inject — bad
+        # extents, non-injector-safe shape types, invisible (alpha=0)
+        # shapes without is_mask=true. Re-runs validation even if the
+        # JSON was already auto-validated at load time, so users can
+        # check after a hand-edit. Disabled until a JSON is loaded.
+        self._validate_act = QAction("&Validate current JSON…", self)
+        self._validate_act.setStatusTip(
+            "Run fd6.shapes v1 schema validation on the currently-loaded "
+            "JSON and show every finding (errors, warnings, info)"
+        )
+        self._validate_act.triggered.connect(self._on_validate_current_json)
+        self._validate_act.setEnabled(False)   # nothing loaded yet
+        tools_menu.addAction(self._validate_act)
+
+        # Save diagnostics bundle: zip the GPU logs + runtime marker +
+        # system info so testers can email a single attachment when
+        # something goes wrong. Lives under Tools regardless of the
+        # GPU flag because diagnostics are useful for non-GPU issues
+        # too (the bundle includes inject logs from the existing
+        # injector flow via the same logs directory).
+        diag_act = QAction("Save &diagnostics zip…", self)
+        diag_act.setStatusTip(
+            "Bundle recent logs + runtime state + system info into a "
+            "zip you can email for support"
+        )
+        diag_act.triggered.connect(self._on_save_diagnostics)
+        tools_menu.addAction(diag_act)
 
         view_menu = mbar.addMenu("&View")
         theme_menu = view_menu.addMenu("&Theme")
@@ -388,6 +550,37 @@ class MainWindow(QMainWindow):
             return
         self._apply_suite_mode(mode)
         save_suite_mode(mode)
+
+    def _prompt_gpu_install_on_first_launch(self) -> None:
+        """First-launch CUDA detection + install offer (#99).
+
+        Self-gates via `should_prompt()` — does nothing if the runtime
+        is already installed, the user previously opted out, the
+        GPU_PHASE_3_AVAILABLE flag is off, or no NVIDIA GPU is
+        present. On 'Install now', chains into the existing
+        RuntimeInstallDialog so users land in the same flow they'd
+        get from Tools → Install GPU runtime.
+        """
+        from forza_abyss_painter.gui.gpu_first_launch import (
+            GpuPromptDecision, maybe_prompt,
+        )
+        result = maybe_prompt(self)
+        if result.decision is GpuPromptDecision.INSTALL_NOW:
+            # Reuse the existing install dialog — single source of
+            # truth for the install flow (download progress, error
+            # handling, marker write-back).
+            from forza_abyss_painter.gui.runtime_install_dialog import (
+                RuntimeInstallDialog,
+            )
+            dlg = RuntimeInstallDialog(self)
+            dlg.exec()
+            # After the install finishes we refresh the status bar so
+            # the GPU label flips from "not installed" to "ready" on
+            # the spot, without the user needing to re-open menus.
+            try:
+                self._refresh_gpu_status_indicator()
+            except Exception:
+                pass   # status bar is decorative — don't break flow
 
     def _prompt_suite_on_first_launch(self) -> None:
         """Show the 4-tile suite picker if the user has never picked one.
@@ -586,6 +779,28 @@ class MainWindow(QMainWindow):
         )
         self.settings_panel.inject_btn.setToolTip(tip)
 
+    def _on_install_gpu_runtime(self) -> None:
+        """Tools menu → Install GPU runtime. Direct entry point — opens
+        the install dialog regardless of current install state so users
+        can install fresh or re-install over a partial state.
+
+        After the dialog closes, refresh the status indicator so the
+        user immediately sees the new GPU state."""
+        from forza_abyss_painter.gui.runtime_install_dialog import (
+            RuntimeInstallDialog,
+        )
+        dlg = RuntimeInstallDialog(self)
+        dlg.exec()
+        # Refresh BOTH GPU indicators (status bar + settings dropdown)
+        # so the user sees the result of the install they just ran
+        # without needing to restart the EXE.
+        self._refresh_gpu_status_indicator()
+        self.settings_panel.refresh_backend_state()
+        if dlg.was_installed:
+            self.statusBar().showMessage(
+                "GPU runtime installed — ready to Generate.", 6000,
+            )
+
     def _on_generate_locally(self) -> None:
         """Tools menu → Generate shapes locally. Lazy-import the dialog so
         the runtime modules don't get loaded on startup (kept off the hot
@@ -596,7 +811,10 @@ class MainWindow(QMainWindow):
         from forza_abyss_painter.gui.generate_dialog import (
             open_generate_dialog_if_runtime_ready,
         )
-        out = open_generate_dialog_if_runtime_ready(self)
+        out = open_generate_dialog_if_runtime_ready(
+            self,
+            gpu_budget_gib=float(self.settings_panel.selected_vram_budget_gib()),
+        )
         if out is not None and out.exists():
             # Reuse the existing JSON-load preview path so the generated
             # output flows through the same preview + inject lineup as an
@@ -604,6 +822,106 @@ class MainWindow(QMainWindow):
             self._on_json_loaded_for_preview(out)
             self.statusBar().showMessage(
                 f"Generated {out.name} — ready to inject.", 8000,
+            )
+
+    def _on_validate_current_json(self) -> None:
+        """Tools menu → Validate current JSON. Re-runs validation on
+        the JSON loaded via Upload JSON and shows every finding in a
+        scrollable modal. If the user hasn't loaded a JSON yet, shows
+        a hint instead of the dialog (the menu action is supposed to
+        be disabled in that state, but defensive guard).
+
+        Re-reads the file from disk rather than using the cached issue
+        list — that way users get fresh validation after a hand-edit
+        without having to Upload JSON again."""
+        from forza_abyss_painter.gui.validation_dialog import show_validation_dialog
+        if not self._loaded_json_path or not self._loaded_json_path.exists():
+            QMessageBox.information(
+                self, "Validate JSON",
+                "Load a JSON via Upload JSON first, then re-run this "
+                "to see schema findings.",
+            )
+            return
+        # Re-read + re-validate from disk. Pulls in any external edits.
+        import json
+        from forza_abyss_painter.io.json_schema import FD6Document
+        from forza_abyss_painter.io.validator import validate_document
+        try:
+            raw = json.loads(self._loaded_json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            QMessageBox.critical(
+                self, "Re-validate failed",
+                f"Could not re-read {self._loaded_json_path.name}: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return
+        # Run through FD6Document.from_dict so legacy JSONs get
+        # normalized to v1 before validation — same path as load_json.
+        try:
+            doc = FD6Document.from_dict(raw)
+            issues = validate_document(doc.to_dict())
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Re-validate failed",
+                f"Could not normalize document: {type(exc).__name__}: {exc}",
+            )
+            return
+        # Update the cache so subsequent inject-time reads see the
+        # fresh findings too.
+        self._loaded_json_issues = issues
+        show_validation_dialog(
+            self, issues,
+            title=f"Validation: {self._loaded_json_path.name}",
+        )
+
+    def _on_save_diagnostics(self) -> None:
+        """Tools menu → Save diagnostics zip. Opens a file picker for
+        the output path, calls the diagnostics-bundle library, then
+        shows the result in the status bar so the user knows where the
+        file landed. On error, surfaces a modal with the OS error
+        message so the user knows what to retry."""
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        from datetime import datetime, timezone
+        from forza_abyss_painter.runtime.diagnostics import build_bundle
+
+        default = (
+            Path.home() /
+            f"ForzaAbyssPainter-diag-"
+            f"{datetime.now(timezone.utc).strftime('%Y-%m-%d-%H%M%S')}.zip"
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save diagnostics zip",
+            str(default), "Zip archive (*.zip)",
+        )
+        if not path:
+            return
+        try:
+            result = build_bundle(Path(path))
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Couldn't save diagnostics",
+                f"Failed to write bundle:\n\n"
+                f"{type(exc).__name__}: {exc}",
+            )
+            return
+        size_mb = result.stat().st_size / (1 << 20)
+        self.statusBar().showMessage(
+            f"Diagnostics saved to {result.name} ({size_mb:.1f} MiB)",
+            10000,
+        )
+
+    def _on_clean_json(self) -> None:
+        """Tools menu → Clean current JSON. Lazy-import the dialog so
+        the cleanup deps don't load until first use. On a successful
+        save the cleaned JSON auto-loads into the preview panel via
+        the same path Upload JSON uses — so the user immediately sees
+        the cleaned result and can re-inject without an extra click."""
+        from forza_abyss_painter.gui.clean_dialog import open_clean_json_dialog
+        out = open_clean_json_dialog(self)
+        if out is not None and out.exists():
+            self._on_json_loaded_for_preview(out)
+            self.statusBar().showMessage(
+                f"Cleaned JSON saved to {out.name} — ready to inject.", 8000,
             )
 
     def _on_files_selected(self, paths: list[Path]) -> None:
@@ -622,11 +940,18 @@ class MainWindow(QMainWindow):
                     6000,
                 )
             return
-        # Forza path — unchanged from v0.3.0 behavior.
+        # Forza path — queue but don't auto-start. The Start button
+        # (settings_panel.start_clicked) is the only trigger for a fresh
+        # run from a quiet queue. Once running, the auto-chain in
+        # _on_done still picks up the next queued item — that's batch
+        # processing UX and stays intact.
         for p in paths:
             self.queue.add(p)
         if self._worker is None:
-            self._start_next()
+            self.statusBar().showMessage(
+                f"Queued {len(paths)} image(s). Click Start to begin.",
+                6000,
+            )
 
     def _refresh_ac_preview(self) -> None:
         """Rebuild the AC cycling-slot preview from the current source image
@@ -682,6 +1007,17 @@ class MainWindow(QMainWindow):
         # When ON (default), we composite transparent areas onto white before generation.
         # When OFF, transparent areas remain transparent and don't get shapes.
         add_white_bg = self.settings_panel.sticker_mode_cb.isChecked()
+
+        # Branch on user-selected backend. CPU path is the original
+        # in-process GenerationWorker with live shape-by-shape preview.
+        # GPU path subprocess'es torch_runner via GpuGenWorker — no
+        # live preview (subprocess writes JSON at the end), but it's
+        # 5-30× faster. See settings_panel for the selector.
+        backend = self.settings_panel.selected_backend()
+        if backend == "gpu":
+            self._start_gpu(next_path, profile, sticker_mode=not add_white_bg)
+            return
+
         self._worker = GenerationWorker(next_path, profile, sticker_mode=not add_white_bg)
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
@@ -694,6 +1030,189 @@ class MainWindow(QMainWindow):
         self._thread.start()
         self.settings_panel.set_running(True)
         self.statusBar().showMessage(f"Generating: {next_path.name}")
+
+    def _start_gpu(self, image_path: Path, profile, sticker_mode: bool) -> None:
+        """GPU shape-gen path. Writes an IPC config + spawns GpuGenWorker
+        in a QThread. Progress shows in the status bar (no live preview
+        — subprocess writes the final JSON at the end). On done: load
+        the JSON into the preview pane via the same _on_json_loaded
+        flow Upload JSON uses, so the user gets identical post-gen UX
+        regardless of backend."""
+        import json as _json
+        from forza_abyss_painter.gui.gpu_gen_worker import GpuGenWorker
+        from forza_abyss_painter.runtime.torch_installer import (
+            embedded_python_exe, is_runtime_installed,
+        )
+        if not is_runtime_installed():
+            # Defensive — settings panel should have prompted install,
+            # but the user may have cancelled. Surface a clear modal.
+            QMessageBox.warning(
+                self, "GPU runtime not installed",
+                "Pick 'GPU' from 'Generate using:' and accept the runtime "
+                "install when prompted, then click Start again.",
+            )
+            self.queue.set_status(image_path, "queued")
+            return
+
+        # Build the baked preset dict (what the profile defaults to).
+        preset_baked = {
+            "label": profile.name,
+            "num_shapes": profile.stop_at,
+            "max_resolution": profile.max_resolution,
+            "random_samples": profile.random_samples,
+        }
+        budget_gib = self.settings_panel.selected_vram_budget_gib()
+
+        # Centralized chunk-aware preflight (chunked-K Task 2). The
+        # helper probes free VRAM, asks the chunk-aware estimator for
+        # the actual runtime peak, then blocks/warns/proceeds. The
+        # preset is NEVER modified -- chunking is handled inside the
+        # engine via vram_budget_gib at scoring time.
+        proceed, info = gpu_run_preflight(
+            parent=self,
+            preset=preset_baked,
+            budget_gib=float(budget_gib),
+            context="Generate from drop",
+        )
+        if not proceed:
+            self.queue.set_status(image_path, "queued")
+            self.statusBar().showMessage(
+                "GPU run cancelled — VRAM preflight blocked.", 5000,
+            )
+            return
+        preset = preset_baked
+
+        # Chunk-aware breadcrumb for the "GPU generating" status-bar
+        # message. When the engine will split the K-batch into multiple
+        # scoring chunks, surface that so the user knows wall time will
+        # be ~N× longer than a single-chunk run.
+        chunks_per_shape = int(info.get("chunks_per_shape", 1))
+        peak_gib = float(info.get("peak_gib", 0.0))
+        if chunks_per_shape > 1:
+            autotune_message = (
+                f"chunked into {chunks_per_shape} batches/shape "
+                f"(peak ~{peak_gib:.1f} GiB)"
+            )
+        else:
+            autotune_message = (
+                f"single-chunk run (peak ~{peak_gib:.1f} GiB)"
+            )
+        output_path = image_path.parent / image_path.stem / f"{image_path.stem}.json"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        config = build_run_config(image_path, output_path, preset,
+                                    sticker_mode=sticker_mode,
+                                    vram_budget_gib=float(budget_gib))
+        config_path = image_path.parent / f".{image_path.stem}_gpu_config.json"
+        try:
+            config_path.write_text(_json.dumps(config, indent=2),
+                                    encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Couldn't start GPU run",
+                f"Failed to write GPU config: {exc}",
+            )
+            self.queue.set_status(image_path, "queued")
+            return
+        self._worker = GpuGenWorker(
+            embedded_python_exe=embedded_python_exe(),
+            config_path=config_path,
+        )
+        self._thread = QThread(self)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        # Display the source image immediately so the middle panel
+        # stops sitting on "Idle". The CPU path does this around line
+        # 1068 — the GPU path used to skip it (regression).
+        self.preview.set_source(image_path)
+        # Update both the middle PreviewPanel (progress bar + status
+        # label) AND the bottom QMainWindow status bar via _on_gpu_progress
+        # (which adds the rate + ETA context).
+        self._worker.progress.connect(self.preview.on_progress)
+        self._worker.checkpoint.connect(self.preview.on_progress)
+        self._worker.progress.connect(self._on_gpu_progress)
+        self._worker.checkpoint.connect(self._on_gpu_progress)
+        self._worker.snapshot.connect(self._on_gpu_snapshot)
+        self._worker.done.connect(self._on_gpu_done)
+        self._worker.error.connect(self._on_gpu_error)
+        self._worker.finished.connect(self._teardown_thread)
+        # Capture start time so the GPU progress slot can compute a
+        # live shapes/sec rate + ETA — same formula the colab pipeline
+        # prints (engine.py:522-527 in the sister repo). Without this,
+        # users staring at a frozen "shape N of T" indicator have no
+        # way to judge whether the run takes 1 minute or 30.
+        import time as _time
+        self._gpu_run_start_t = _time.monotonic()
+        self._thread.start()
+        self.settings_panel.set_running(True)
+        # Embed the autotune outcome in the "GPU generating" message
+        # (#131 review GAP 3 fix). Previously the autotune showMessage(6000ms)
+        # was synchronously overwritten by this line before the event loop
+        # rendered a single frame.
+        self.statusBar().showMessage(
+            f"GPU generating: {image_path.name} — "
+            f"{autotune_message} (live progress in preview panel)"
+        )
+
+    def _on_gpu_progress(self, shape_count: int, total: int) -> None:
+        if total <= 0:
+            return
+        pct = max(0, min(100, int(100 * shape_count / total)))
+        # Live rate + ETA from start-of-run timestamp. Mirrors the
+        # colab engine's `print(f"{idx}/{total} ({rate}/s, ETA {eta}s, RMS …)")`
+        # so users see a moving clock + speed signal regardless of
+        # GPU model. Skip the ETA on the first event (rate not yet
+        # meaningful with elapsed near zero).
+        import time as _time
+        elapsed = _time.monotonic() - getattr(self, "_gpu_run_start_t",
+                                              _time.monotonic())
+        if elapsed > 1.0 and shape_count > 0:
+            rate = shape_count / elapsed
+            eta_s = int((total - shape_count) / rate) if rate > 0 else 0
+            mins, secs = divmod(eta_s, 60)
+            eta_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+            self.statusBar().showMessage(
+                f"GPU: shape {shape_count} of {total} ({pct}%) — "
+                f"{rate:.1f} shapes/s, ETA {eta_str}"
+            )
+        else:
+            self.statusBar().showMessage(
+                f"GPU: shape {shape_count} of {total} ({pct}%)"
+            )
+
+    def _on_gpu_done(self, output_path: str, shape_count: int) -> None:
+        if self._current_path:
+            self.queue.set_status(self._current_path, "done")
+        out = Path(output_path)
+        self._last_finished_json = out
+        self.statusBar().showMessage(
+            f"GPU done — {shape_count} shapes saved to {out.name}", 8000,
+        )
+        # Auto-load into preview via the same path Upload JSON uses,
+        # so the user immediately sees the result + can inject.
+        self._on_json_loaded_for_preview(out)
+        self.upload.mark_json_ready(out)
+
+    def _on_gpu_error(self, stage: str, message: str) -> None:
+        if self._current_path:
+            self.queue.set_status(self._current_path, "error")
+        QMessageBox.critical(
+            self, f"GPU generation failed — {stage}",
+            f"Stage: {stage}\n\n{message}\n\n"
+            f"For post-mortem: Tools → Save diagnostics zip…",
+        )
+
+    def _on_gpu_install_requested(self) -> None:
+        """SettingsPanel emitted gpu_install_requested — user picked GPU
+        from the backend dropdown but the runtime isn't installed. Open
+        the install dialog; on close, refresh the dropdown label so the
+        user sees the new state."""
+        from forza_abyss_painter.gui.runtime_install_dialog import (
+            RuntimeInstallDialog,
+        )
+        dlg = RuntimeInstallDialog(self)
+        dlg.exec()
+        self.settings_panel.refresh_backend_state()
+        self._refresh_gpu_status_indicator()
 
     def _on_finished(self, out_path: str) -> None:
         if self._current_path:
@@ -745,18 +1264,503 @@ class MainWindow(QMainWindow):
         if json_path:
             self._on_inject_json_path(Path(json_path))
 
+    def _prompt_source_image_picker(self, hint_filename: str) -> Path | None:
+        """Fallback file picker when the sibling source image is missing.
+        Returns the user-picked path or None on cancel."""
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        QMessageBox.information(
+            self, "Source image not found",
+            f"The loaded JSON refers to source image '{hint_filename}', "
+            f"but no file with that name exists next to the JSON. "
+            f"Pick the source image manually.",
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Pick source image (looking for '{hint_filename}')",
+            "", "Images (*.png *.jpg *.jpeg *.webp);;All files (*)",
+        )
+        return Path(path) if path else None
+
+    def _resolve_source_for_loaded_json(self, json_path: Path) -> Path | None:
+        """Resolve the source image for a loaded JSON. Returns None when
+        the user cancels the picker fallback — caller aborts silently."""
+        from forza_abyss_painter.io.exporter import load_json
+        try:
+            doc = load_json(str(json_path))
+        except Exception:
+            # Validator already gated us on load; getting here means the
+            # file changed between load and this call. Treat as fatal.
+            return None
+        sibling = _resolve_source_image_path(json_path, doc.source_image)
+        if sibling is not None:
+            return sibling
+        return self._prompt_source_image_picker(doc.source_image or "<unknown>")
+
+    def _on_reshape_requested(self, json_path: Path) -> None:
+        """#85 — user clicked Re-shape-gen at higher budget. Resolve the
+        source image, then open the existing GenerateLocallyDialog
+        pre-populated with that source."""
+        source = self._resolve_source_for_loaded_json(json_path)
+        if source is None:
+            return
+        from forza_abyss_painter.gui.generate_dialog import GenerateLocallyDialog
+        from forza_abyss_painter.gui.runtime_install_dialog import (
+            prompt_install_or_use_existing,
+        )
+        if not prompt_install_or_use_existing(self):
+            return
+        dlg = GenerateLocallyDialog(
+            self,
+            initial_source_path=source,
+            gpu_budget_gib=float(self.settings_panel.selected_vram_budget_gib()),
+        )
+        from PySide6.QtWidgets import QDialog as _QDialog
+        if dlg.exec() == _QDialog.DialogCode.Accepted and dlg.output_path:
+            self._on_json_loaded_for_preview(dlg.output_path)
+
+    def _on_polish_requested(self, json_path: Path) -> None:
+        """#86 — user clicked Polish loaded JSON. Resolve the source
+        image, open PolishDialog, on accept spawn GpuGenWorker with the
+        polish config."""
+        from PySide6.QtWidgets import QMessageBox
+        if getattr(self, "_polish_thread", None) and self._polish_thread.isRunning():
+            from PySide6.QtWidgets import QMessageBox as _QMessageBox
+            _QMessageBox.information(self, "Polish running",
+                                       "A polish run is already in progress.")
+            return
+        source = self._resolve_source_for_loaded_json(json_path)
+        if source is None:
+            return
+        from forza_abyss_painter.gui.polish_dialog import PolishDialog
+        from forza_abyss_painter.gui.runtime_install_dialog import (
+            prompt_install_or_use_existing,
+        )
+        from forza_abyss_painter.runtime.torch_installer import embedded_python_exe
+        if not prompt_install_or_use_existing(self):
+            return
+
+        # Preflight (VRAM honesty correction Task 9). Polish does NOT
+        # use random_samples (K), so the synthetic preset uses K=0 —
+        # the only VRAM driver is the canvas size, which we read off
+        # the loaded JSON's image_size. If the user's budget can't fit
+        # the canvas, the helper blocks and we abort cleanly.
+        from forza_abyss_painter.io.exporter import load_json as _load_json
+        try:
+            _polish_doc = _load_json(str(json_path))
+            _polish_w = int(max(_polish_doc.image_size)) if _polish_doc.image_size else 1200
+        except Exception:
+            _polish_w = 1200
+        polish_preset = {
+            "random_samples": 0,
+            "max_resolution": _polish_w,
+        }
+        proceed, _info = gpu_run_preflight(
+            parent=self,
+            preset=polish_preset,
+            budget_gib=float(self.settings_panel.selected_vram_budget_gib()),
+            context="Polish loaded JSON",
+        )
+        if not proceed:
+            self.statusBar().showMessage(
+                "Polish cancelled — VRAM preflight blocked.", 5000,
+            )
+            return
+
+        dlg = PolishDialog(self,
+                            loaded_json_path=json_path,
+                            source_image_path=source)
+        from PySide6.QtWidgets import QDialog as _QDialog
+        if dlg.exec() != _QDialog.DialogCode.Accepted:
+            return
+        values = dlg.values()
+
+        # Mirror the fresh-gen sticker convention: sticker_mode = "no
+        # white-bg composite" = the "Add white background" checkbox is
+        # UNCHECKED. `not isChecked()` → True means transparent target
+        # → sticker_mode=True.
+        sticker = bool(getattr(self.settings_panel, "sticker_mode_cb", None) and
+                        not self.settings_panel.sticker_mode_cb.isChecked())
+
+        config = build_polish_config(
+            source_image_path=source,
+            input_shapes_path=json_path,
+            output_path=values["output_path"],
+            steps=values["steps"],
+            lock_alpha=values["lock_alpha"],
+            sticker_mode=sticker,
+        )
+        config_path = json_path.parent / f".{json_path.stem}_polish_config.json"
+        try:
+            config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(self, "Couldn't start polish",
+                                  f"Failed to write polish config: {exc}")
+            return
+        py = embedded_python_exe()
+        if not py.exists():
+            QMessageBox.critical(
+                self, "GPU runtime missing",
+                f"Embedded Python not found at {py}. "
+                f"Open Tools → Generate shapes locally to install the runtime.",
+            )
+            return
+
+        # Spawn the worker on a QThread — same pattern GenerateLocallyDialog uses.
+        # Re-import locally so monkeypatch.setattr on the source module
+        # reaches this site.
+        from forza_abyss_painter.gui.gpu_gen_worker import (
+            GpuGenWorker as _GpuGenWorker,
+        )
+        self._polish_thread = QThread(self)
+        self._polish_worker = _GpuGenWorker(
+            embedded_python_exe=py,
+            config_path=config_path,
+        )
+        self._polish_worker.moveToThread(self._polish_thread)
+        self._polish_thread.started.connect(self._polish_worker.run)
+        self._polish_worker.started.connect(self._on_polish_started)
+        # Chunked-K Task 4: also drive the middle PreviewPanel so the
+        # polish run isn't invisible there. CPU + GPU-fresh + Resume
+        # all do this; Polish was the odd one out, updating only the
+        # bottom QMainWindow status bar via _on_polish_progress.
+        self._polish_worker.progress.connect(self.preview.on_progress)
+        self._polish_worker.checkpoint.connect(self.preview.on_progress)
+        self._polish_worker.progress.connect(self._on_polish_progress)
+        self._polish_worker.checkpoint.connect(self._on_polish_progress)
+        self._polish_worker.done.connect(self._on_polish_done)
+        self._polish_worker.error.connect(self._on_polish_error)
+        self._polish_worker.finished.connect(self._polish_thread.quit)
+        self._polish_worker.finished.connect(self._polish_worker.deleteLater)
+        self._polish_thread.finished.connect(self._polish_thread.deleteLater)
+        self.statusBar().showMessage("Polishing — running optimizer on GPU…")
+        self._polish_thread.start()
+
+    # ------------------------------------------------------------------
+    # Snapshot preview wiring
+    # ------------------------------------------------------------------
+
+    def _on_gpu_snapshot(self, count: int, total: int, snapshot_path: str) -> None:
+        """Runner just wrote a snapshot; dispatch a render off-thread.
+
+        Single-slot throttle: if a render is already in flight, just
+        remember the latest path. When the in-flight job finishes, if
+        a newer path is pending, start it. Drops intermediate renders
+        if snapshots fire faster than render — for GPU at every-100,
+        this rarely matters but it bounds memory + thread churn.
+        """
+        from pathlib import Path as _Path
+        self.statusBar().showMessage(
+            f"GPU: snapshot saved at {count}/{total} → "
+            f"{_Path(snapshot_path).name}", 2000,
+        )
+        if self._snapshot_render_in_flight:
+            self._snapshot_pending_path = snapshot_path
+            return
+        self._dispatch_snapshot_render(snapshot_path)
+
+    def _dispatch_snapshot_render(self, snapshot_path: str) -> None:
+        from PySide6.QtCore import QThreadPool, QTimer
+        self._snapshot_render_in_flight = True
+        job = _RenderSnapshotJob(snapshot_path, self.preview)
+        # Surface render failures in the status bar — without this the
+        # render path is invisible to users when it breaks (the EXE
+        # cannot tail stderr). 6s message timeout matches other
+        # transient diagnostics in MainWindow.
+        job.emitter.render_failed.connect(
+            lambda msg: self.statusBar().showMessage(msg, 6000)
+        )
+        QThreadPool.globalInstance().start(job)
+        # QRunnable doesn't expose a finished signal; use a one-shot
+        # timer (3s) to clear the flag + dispatch any pending render.
+        # If a render actually takes longer, the next snapshot just
+        # adds to the pending queue with no harm.
+        QTimer.singleShot(3000, self._snapshot_render_drain)
+
+    def _snapshot_render_drain(self) -> None:
+        self._snapshot_render_in_flight = False
+        if self._snapshot_pending_path is not None:
+            pending = self._snapshot_pending_path
+            self._snapshot_pending_path = None
+            self._dispatch_snapshot_render(pending)
+
+    # ------------------------------------------------------------------
+    # Resume-from-snapshot wiring
+    # ------------------------------------------------------------------
+
+    def _on_resume_requested(self, snapshot_path: "Path") -> None:
+        """User picked a snapshot to resume from. Resolve source image,
+        open ResumeDialog, on accept spawn GpuGenWorker with the
+        dialog's values dict."""
+        from PySide6.QtWidgets import QMessageBox, QFileDialog
+        from PySide6.QtWidgets import QDialog as _QDialog
+        from pathlib import Path as _Path
+
+        # Guard against an active run. Resume button isn't gated by
+        # set_running(True), so we have to check here. If a worker is
+        # active, clicking Resume would overwrite self._worker/_thread
+        # and the old worker's finished signal would later tear down
+        # the NEW run's thread.
+        if getattr(self, "_thread", None) is not None and self._thread.isRunning():
+            QMessageBox.information(
+                self, "Run in progress",
+                "A GPU run is already in progress. Wait for it to finish "
+                "(or Cancel from the Generate dialog) before starting a "
+                "resume.",
+            )
+            return
+
+        # Load + sanity-check snapshot.
+        try:
+            from forza_abyss_painter.io.exporter import load_json
+            doc = load_json(str(snapshot_path))
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Couldn't load snapshot",
+                f"Snapshot {snapshot_path.name} could not be loaded:\n\n"
+                f"{type(exc).__name__}: {exc}",
+            )
+            return
+
+        # Resolve source image (same-folder heuristic + picker).
+        sibling = _resolve_source_image_path(snapshot_path, doc.source_image)
+        if sibling is not None:
+            source = sibling
+        else:
+            QMessageBox.information(
+                self, "Source image not found",
+                f"Snapshot references '{doc.source_image}' but it's not "
+                f"next to the snapshot file. Pick it manually.",
+            )
+            picked, _ = QFileDialog.getOpenFileName(
+                self, f"Pick source image (looking for '{doc.source_image}')",
+                "", "Images (*.png *.jpg *.jpeg *.webp);;All files (*)",
+            )
+            if not picked:
+                return
+            source = _Path(picked)
+
+        # Runtime install check (resume uses the GPU runner).
+        from forza_abyss_painter.gui.runtime_install_dialog import (
+            prompt_install_or_use_existing,
+        )
+        if not prompt_install_or_use_existing(self):
+            return
+
+        # Dialog.
+        from forza_abyss_painter.gui.resume_dialog import ResumeDialog
+        dlg = ResumeDialog(
+            parent=self,
+            snapshot_path=snapshot_path,
+            source_image_path=source,
+        )
+        if dlg.exec() != _QDialog.DialogCode.Accepted:
+            return
+        values = dlg.values()
+
+        # Preflight (VRAM honesty correction Task 9). Use the dialog's
+        # chosen max_resolution (which the ResumeDialog may have already
+        # lowered via Task 8 mismatch detection) and the resume K so
+        # the gate evaluates the actual peak VRAM at run time.
+        preset_for_preflight = {
+            "random_samples": int(values["random_samples"]),
+            "max_resolution": int(values["max_resolution"]),
+        }
+        proceed, _info = gpu_run_preflight(
+            parent=self,
+            preset=preset_for_preflight,
+            budget_gib=float(self.settings_panel.selected_vram_budget_gib()),
+            context="Resume from snapshot",
+        )
+        if not proceed:
+            self.statusBar().showMessage(
+                "Resume cancelled — VRAM preflight blocked.", 5000,
+            )
+            return
+        # No effective-preset back-prop: chunked-K handles fit at scoring
+        # time inside the engine. values["max_resolution"] flows through
+        # unchanged from the ResumeDialog.
+
+        # Build the worker config via build_run_config so all the
+        # standard fresh-mode defaults (vram_budget_gib, bbox_local,
+        # checkpoint_every floor) are populated uniformly. Then layer
+        # the resume-specific fields (mode, seed_shapes_path, joint
+        # polish steps, device, lock_alpha override, polish-friendly
+        # output path) on top — those are NOT produced by
+        # build_run_config but ARE required by RunConfig.from_dict
+        # for a resume run.
+        synthetic_preset = {
+            "num_shapes": int(values["num_shapes"]),
+            "max_resolution": int(values["max_resolution"]),
+            "random_samples": int(values["random_samples"]),
+            "label": str(values.get("preset_label", "resumed")),
+            "joint_polish_steps": int(values.get("joint_polish_steps", 0)),
+        }
+        config = build_run_config(
+            image_path=Path(values["image_path"]),
+            output_json_path=Path(values["output_json_path"]),
+            preset=synthetic_preset,
+            sticker_mode=bool(values.get("sticker_mode", False)),
+            vram_budget_gib=float(self.settings_panel.selected_vram_budget_gib()),
+            checkpoint_every=int(values.get("checkpoint_every", 100)),
+            seed_canvas_size=values.get("seed_canvas_size"),
+        )
+        # Resume-specific overrides not covered by build_run_config.
+        config["mode"] = str(values.get("mode", "fresh"))
+        config["seed_shapes_path"] = str(values["seed_shapes_path"])
+        config["lock_alpha"] = bool(values.get("lock_alpha", True))
+        config["bbox_local"] = bool(values.get("bbox_local", True))
+
+        config_path = snapshot_path.parent / (
+            f".{snapshot_path.stem}_resume_config.json"
+        )
+        try:
+            config_path.write_text(
+                json.dumps(config, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Couldn't start resume",
+                f"Failed to write resume config: {exc}",
+            )
+            return
+
+        from forza_abyss_painter.runtime.torch_installer import embedded_python_exe
+        py = embedded_python_exe()
+        if not py.exists():
+            QMessageBox.critical(
+                self, "GPU runtime missing",
+                f"Embedded Python not found at {py}. "
+                f"Open Tools → Generate shapes locally to install the runtime.",
+            )
+            return
+
+        # Spawn — same pattern as _start_gpu. Re-import locally so
+        # monkeypatch.setattr on the source module reaches this site.
+        from PySide6.QtCore import QThread
+        from forza_abyss_painter.gui.gpu_gen_worker import (
+            GpuGenWorker as _GpuGenWorker,
+        )
+        self._worker = _GpuGenWorker(
+            embedded_python_exe=py,
+            config_path=config_path,
+        )
+        self._thread = QThread(self)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self.preview.on_progress)
+        self._worker.checkpoint.connect(self.preview.on_progress)
+        self._worker.progress.connect(self._on_gpu_progress)
+        self._worker.checkpoint.connect(self._on_gpu_progress)
+        self._worker.snapshot.connect(self._on_gpu_snapshot)
+        self._worker.done.connect(self._on_gpu_done)
+        self._worker.error.connect(self._on_gpu_error)
+        self._worker.finished.connect(self._teardown_thread)
+        import time as _time
+        self._gpu_run_start_t = _time.monotonic()
+        self.preview.set_source(source)
+        self._thread.start()
+        self.settings_panel.set_running(True)
+        self.statusBar().showMessage(
+            f"Resume started: {snapshot_path.name} → "
+            f"continuing to {values['num_shapes']} shapes"
+        )
+
+    def _on_polish_started(self, summary: dict) -> None:
+        self.statusBar().showMessage("Polish started — running joint_polish on GPU…")
+        # Chunked-K Task 4: surface polish state on the middle
+        # PreviewPanel too. Without this the panel keeps whatever label
+        # it had before polish (often "Idle." or the last fresh-gen
+        # status) and the user has no signal anything is running.
+        self.preview.status_label.setText(
+            "Polishing — running joint_polish optimizer…"
+        )
+        self.preview.progress.setValue(0)
+
+    def _on_polish_progress(self, current: int, total: int) -> None:
+        if total > 0:
+            self.statusBar().showMessage(f"Polish — step {current}/{total}")
+
+    def _on_polish_done(self, output_path: str, shape_count: int) -> None:
+        path = Path(output_path)
+        self.statusBar().showMessage(
+            f"Polish done — {shape_count} shapes saved to {path.name}", 10000,
+        )
+        # Chunked-K Task 4: leave the middle PreviewPanel on a clear
+        # "done" state instead of whatever step count the last
+        # progress signal happened to leave it at.
+        self.preview.progress.setValue(100)
+        self.preview.status_label.setText(
+            f"Polish done — {shape_count} shapes"
+        )
+        # Auto-load the polished JSON into the preview so the user can
+        # compare visually + click Inject when ready.
+        self._on_json_loaded_for_preview(path)
+        self._polish_thread = None
+        self._polish_worker = None
+
+    def _on_polish_error(self, stage: str, message: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.critical(self, f"Polish failed — {stage}",
+                              f"Stage: {stage}\n\n{message}")
+        self.statusBar().showMessage(f"Polish failed at {stage}.", 10000)
+        # Chunked-K Task 4: surface the failure on the middle panel
+        # too, otherwise it'd stay stuck on "Polishing…" with a
+        # half-filled progress bar.
+        self.preview.status_label.setText(f"Polish failed at {stage}")
+        self.preview.progress.setValue(0)
+        self._polish_thread = None
+        self._polish_worker = None
+
     def _on_json_loaded_for_preview(self, json_path: Path) -> None:
         """User clicked Upload JSON -> load the file, render shapes onto the preview pane.
         Does NOT inject. User must click Inject into FH6 after to actually push to game.
+
+        Auto-validates the loaded JSON against fd6.shapes v1 schema. ERROR-severity
+        findings block the preview (the JSON wouldn't inject anyway); WARNINGs flow
+        through to a status-bar message + the cached issue list (re-viewable via
+        Tools → Validate current JSON). See #100 / docs/JSON_SPEC.md.
         """
         from forza_abyss_painter.io.exporter import load_json
+        from forza_abyss_painter.io.validator import Severity, validate_document
         from forza_abyss_painter.shapegen.render import render_shapes
+        from forza_abyss_painter.gui.validation_dialog import (
+            show_validation_dialog, summarize_for_status_bar,
+        )
         try:
             doc = load_json(str(json_path))
             shapes = doc.materialize_shapes()
         except Exception as exc:
             QMessageBox.critical(self, "Load failed", f"{type(exc).__name__}: {exc}")
+            self.upload.set_json_loaded(None)
             return
+
+        # Validate the normalized document (legacy JSONs have already been
+        # converted to native v1 by load_json → FD6Document.from_dict).
+        validation_issues = validate_document(doc.to_dict())
+        errors = [i for i in validation_issues if i.severity is Severity.ERROR]
+        if errors:
+            # Surface ALL findings (not just errors) so the user sees full
+            # context — but block the preview render because a broken JSON
+            # would either crash the renderer or paint nonsense.
+            show_validation_dialog(
+                self, validation_issues,
+                title=f"Cannot load: {json_path.name} has validation errors",
+            )
+            self.statusBar().showMessage(
+                f"Load aborted — {len(errors)} validation error(s) in {json_path.name}",
+                8000,
+            )
+            self.upload.set_json_loaded(None)
+            return
+        # Cache the issues + path so the Tools menu can re-show them
+        # without re-loading the file. Status-bar one-liner if there's
+        # anything worth mentioning (warnings); silent on clean.
+        self._loaded_json_issues = validation_issues
+        summary = summarize_for_status_bar(validation_issues)
+        if summary:
+            self.statusBar().showMessage(
+                f"{summary} — review via Tools → Validate current JSON", 6000,
+            )
         w, h = doc.image_size if doc.image_size and doc.image_size[0] > 0 else (1200, 800)
         self.statusBar().showMessage(f"Rendering preview of {len(shapes)} shapes from {json_path.name}...")
         # Render with transparent backdrop when EITHER:
@@ -775,6 +1779,11 @@ class MainWindow(QMainWindow):
         )
         self.preview.progress.setValue(100)
         self._loaded_json_path = json_path
+        self.upload.set_json_loaded(json_path)
+        # Enable Tools → Validate current JSON now that we have something
+        # to validate. Stays enabled across subsequent loads.
+        if hasattr(self, "_validate_act"):
+            self._validate_act.setEnabled(True)
         self.statusBar().showMessage(
             f"Preview ready. Click 'Inject into FH6' to push these shapes into the game.", 8000
         )
@@ -1054,6 +2063,14 @@ class MainWindow(QMainWindow):
             # One event-loop tick of delay so the window has fully painted
             # before the modal blocks it — avoids a black-frame flash.
             QTimer.singleShot(0, self._prompt_suite_on_first_launch)
+        # GPU install offer (#99). Fires AFTER the suite picker so the
+        # user isn't hit with two modals at once on a brand-new session.
+        # Self-gates internally (skips when already installed / opted
+        # out / no NVIDIA GPU). Runs once per session via a flag so
+        # window-show events on focus toggles don't re-trigger.
+        if not getattr(self, "_gpu_first_launch_checked", False):
+            self._gpu_first_launch_checked = True
+            QTimer.singleShot(50, self._prompt_gpu_install_on_first_launch)
         if hasattr(self, "particles") and self.particles is not None:
             self.particles.reposition()
             self._sync_particle_exclude_rect()

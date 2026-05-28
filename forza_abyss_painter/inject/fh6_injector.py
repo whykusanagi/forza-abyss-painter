@@ -647,7 +647,7 @@ def check_inject_readiness(
         if not fit_ok:
             log(f"capacity miss: active group has {layer_count} slots, JSON needs "
                 f"{expected_count}. Load a larger template "
-                f"(10/20/50/100/500/1500/3000).")
+                f"(10/20/50/100/500/1000/1500/1800/3000).")
             return ReadinessReport(
                 pid=pid, process_name=resolved_name, module_base=base_addr,
                 signature_addr=found_addr, mirror_ok=True, addr_a=addr_a,
@@ -1152,8 +1152,8 @@ class FH6Injector(Injector):
                     f"Active vinyl group has only {report.layer_count} layer slots, "
                     f"but the JSON has {layer_count} shapes. The heap-fingerprint "
                     f"fallback wouldn't find a larger template either — load a "
-                    f"bigger sphere-template (10 / 20 / 50 / 100 / 500 / 1500 / "
-                    f"3000) and retry."
+                    f"bigger sphere-template (10 / 20 / 50 / 100 / 500 / "
+                    f"1000 / 1500 / 1800 / 3000) and retry."
                 )
             # Other failure modes (signature drift, mirror fail, hop 2 null
             # on builds where the chain offsets are stale, table garbage):
