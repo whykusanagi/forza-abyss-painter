@@ -204,3 +204,40 @@ def recommend_max_resolution(
     max_res = max(safety_floor_px, max_res)
     max_res = min(absolute_ceiling_px, max_res)
     return max_res
+
+
+def estimate_effective_peak_gib(
+    *,
+    K: int,
+    max_resolution: int,
+    budget_gib: float,
+) -> tuple[float, int]:
+    """Return (peak_gib, chunks_per_shape) accounting for chunked-K.
+
+    When the engine will chunk the K-batch at scoring time (because
+    `budget_gib > 0` and the full K wouldn't fit), the effective per-chunk
+    peak is what actually allocates on the GPU. When `budget_gib == 0`
+    or the full K already fits, no chunking is applied and the result
+    matches `estimate_peak_vram_gib(K=K, ...)`.
+
+    Always assumes `bbox_local=True` (production EXE path; chunking only
+    works for bbox_local scoring -- see engine.py `_resolve_k_chunk_size`
+    comment).
+    """
+    chunk = resolve_k_chunk_size(
+        K=K,
+        max_resolution=max_resolution,
+        bbox_local=True,
+        vram_budget_gib=budget_gib,
+    )
+    if chunk <= 0:
+        peak = estimate_peak_vram_gib(
+            K=K, bbox_local=True, max_resolution=max_resolution,
+        )
+        return peak, 1
+
+    chunks_per_shape = (K + chunk - 1) // chunk
+    peak = estimate_peak_vram_gib(
+        K=chunk, bbox_local=True, max_resolution=max_resolution,
+    )
+    return peak, chunks_per_shape
