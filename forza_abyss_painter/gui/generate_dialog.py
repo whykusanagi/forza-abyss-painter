@@ -135,7 +135,7 @@ class GenerateLocallyDialog(QDialog):
                 max_resolution=int(p["max_resolution"]),
             )
             self.preset_combo.addItem(
-                f"{p['label']}  (~{live_peak:.0f} GiB peak full pipeline)",
+                f"{p['label']}  (~{live_peak:.0f} GiB peak)",
                 userData=p,
             )
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
@@ -312,7 +312,7 @@ class GenerateLocallyDialog(QDialog):
             return
         # Phase 2: VRAM probe needs the installed runtime to import torch.
         # Phase 3 will subprocess-call torch_runner to do the probe. For
-        # now show the live full-pipeline estimate, with a generic
+        # now show the live K-only peak estimate, with a generic
         # recommendation.
         est = estimate_peak_vram_gib(
             K=int(preset["random_samples"]),
@@ -320,7 +320,7 @@ class GenerateLocallyDialog(QDialog):
             max_resolution=int(preset["max_resolution"]),
         )
         self.vram_info.setText(
-            f"Estimated peak VRAM: <b>~{est:.0f} GiB</b> (full pipeline). "
+            f"Estimated peak VRAM: <b>~{est:.0f} GiB</b> (peak). "
             f"Make sure your card has at least that much FREE (close FH6 + "
             f"other GPU apps if tight). Phase 3 will probe your card "
             f"directly and warn before launch."
