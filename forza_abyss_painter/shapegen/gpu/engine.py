@@ -352,6 +352,66 @@ def _refine_gradient(kind: ShapeKind, init_params, canvas_u8, target_u8, alpha_t
             float(scores[best].cpu().item()))
 
 
+def _scale_seed_shapes(
+    shapes: "list[dict]",
+    *,
+    snap: tuple[int, int],
+    target: tuple[int, int],
+) -> "list[dict]":
+    """Scale (x, y, rx, ry) by target/snap ratio for canvas resize on resume.
+
+    Resume from a snapshot captured at canvas dims `snap` onto a smaller
+    (or larger) canvas `target` needs each seeded shape's geometry
+    rescaled — otherwise the composite paints at the original pixel
+    coordinates, which on a smaller target either falls off-canvas or
+    leaves a tiny island in one corner. The ResumeDialog (Task 8) calls
+    this when it detects a canvas-size mismatch + the user opts to lower
+    max_resolution to fit a tighter VRAM budget.
+
+    Color and angle are dimensionless and preserved verbatim. Both
+    snake_case shape fields (``"color"`` from fd6.shapes) and the
+    test-only ``"rgba"`` alias are left untouched along with any other
+    non-geometric metadata.
+
+    `snap` and `target` are both (W, H) tuples — same convention as
+    Qt/PIL widget sizes.
+
+    Raises:
+        ValueError: if min scale < 0.3x or max scale > 3.0x in either
+            axis. Beyond that range the rescaled shapes are either too
+            sub-pixel to render meaningfully or stretched far enough
+            that the seeded RMS gain over a fresh run vanishes — the
+            user is better off starting clean than burning compute on
+            unusable seeds.
+    """
+    sw, sh = snap
+    tw, th = target
+    if sw == tw and sh == th:
+        return shapes
+
+    fx = tw / sw
+    fy = th / sh
+    if min(fx, fy) < 0.3 or max(fx, fy) > 3.0:
+        raise ValueError(
+            f"scale factor too extreme: snap={snap} target={target} "
+            f"({fx:.2f}x, {fy:.2f}x); refusing to resize seeded shapes"
+        )
+
+    out: "list[dict]" = []
+    for s in shapes:
+        scaled = dict(s)
+        if "x" in scaled:
+            scaled["x"] = float(scaled["x"]) * fx
+        if "y" in scaled:
+            scaled["y"] = float(scaled["y"]) * fy
+        if "rx" in scaled:
+            scaled["rx"] = float(scaled["rx"]) * fx
+        if "ry" in scaled:
+            scaled["ry"] = float(scaled["ry"]) * fy
+        out.append(scaled)
+    return out
+
+
 def run_gpu(
     target_rgb: np.ndarray,
     cfg: GPUConfig,
@@ -360,6 +420,8 @@ def run_gpu(
     checkpoint_cb=None,
     checkpoint_every: int = 0,
     seed_shapes: "list[dict] | None" = None,
+    *,
+    seed_canvas_size: "tuple[int, int] | None" = None,
 ) -> tuple[list[dict], np.ndarray]:
     """Public entry point — wraps `_run_gpu_inner` with CUDA OOM recovery.
 
@@ -378,13 +440,20 @@ def run_gpu(
     If `seed_shapes` is provided, each shape is replayed onto the canvas
     before the greedy loop, so the loop generates only
     (cfg.num_shapes - len(seed_shapes)) new shapes.
+
+    If `seed_canvas_size` is provided AND differs from the current
+    target canvas dims, `seed_shapes` are rescaled via
+    `_scale_seed_shapes` before replay — needed for resume on a tighter
+    card than the snapshot. Default `None` preserves identical behavior
+    for fresh runs + resume-without-resize.
     """
     try:
         return _run_gpu_inner(target_rgb, cfg, alpha_mask=alpha_mask,
                               progress_every=progress_every,
                               checkpoint_cb=checkpoint_cb,
                               checkpoint_every=checkpoint_every,
-                              seed_shapes=seed_shapes)
+                              seed_shapes=seed_shapes,
+                              seed_canvas_size=seed_canvas_size)
     except torch.cuda.OutOfMemoryError as e:
         # Drop the cached allocator state so a follow-up attempt with
         # lower settings doesn't inherit this run's high-water mark.
@@ -422,6 +491,8 @@ def _run_gpu_inner(
     checkpoint_cb=None,
     checkpoint_every: int = 0,
     seed_shapes: "list[dict] | None" = None,
+    *,
+    seed_canvas_size: "tuple[int, int] | None" = None,
 ) -> tuple[list[dict], np.ndarray]:
     """Run the GPU shape-gen loop. Returns (shapes_as_json_dicts, final_canvas_u8_numpy).
 
@@ -589,6 +660,22 @@ def _run_gpu_inner(
     # then starts at len(seeded) and continues to cfg.num_shapes. The
     # randomness state is unaffected — only the canvas + shapes list
     # change. Polish + refill run at end as usual on the FULL set.
+    #
+    # Canvas-size mismatch (resume on a tighter card): when the caller
+    # passes seed_canvas_size and it differs from the current (w, h),
+    # rescale shape geometry via _scale_seed_shapes before replay so
+    # composites land on the new canvas instead of being clipped or
+    # squashed into a corner. The helper refuses extreme ratios; let
+    # that propagate so the user gets a clear error rather than a
+    # silently unusable resume.
+    if seed_shapes and seed_canvas_size is not None:
+        target_canvas = (int(w), int(h))
+        if seed_canvas_size != target_canvas:
+            seed_shapes = _scale_seed_shapes(
+                seed_shapes,
+                snap=seed_canvas_size,
+                target=target_canvas,
+            )
     if seed_shapes:
         ellipse_kind = KINDS["rotated_ellipse"]
         for s in seed_shapes:
