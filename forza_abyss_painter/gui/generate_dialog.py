@@ -33,7 +33,10 @@ from PySide6.QtWidgets import (
 from forza_abyss_painter.gui.gpu_gen_worker import GpuGenWorker, build_run_config
 from forza_abyss_painter.runtime.nvidia_smi import probe_free_vram
 from forza_abyss_painter.runtime.torch_installer import embedded_python_exe
-from forza_abyss_painter.shapegen.gpu.vram_planner import recommend_max_resolution
+from forza_abyss_painter.shapegen.gpu.vram_planner import (
+    estimate_full_pipeline_gib,
+    recommend_max_resolution,
+)
 
 
 # Local-GPU preset table. Mirrors the Colab notebook lineup but with
@@ -126,8 +129,13 @@ class GenerateLocallyDialog(QDialog):
         # Preset dropdown.
         self.preset_combo = QComboBox(self)
         for p in LOCAL_PRESETS:
+            live_peak = estimate_full_pipeline_gib(
+                K=int(p["random_samples"]),
+                bbox_local=True,
+                max_resolution=int(p["max_resolution"]),
+            )
             self.preset_combo.addItem(
-                f"{p['label']}  (~{p['est_peak_vram_gib']:.1f} GiB peak)",
+                f"{p['label']}  (~{live_peak:.0f} GiB peak full pipeline)",
                 userData=p,
             )
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
@@ -273,13 +281,18 @@ class GenerateLocallyDialog(QDialog):
         preset.setdefault("baked_max_resolution", baked_max_res)
         preset["max_resolution"] = effective_max_res
 
+        live_peak = estimate_full_pipeline_gib(
+            K=int(preset["random_samples"]),
+            bbox_local=True,
+            max_resolution=int(preset["max_resolution"]),
+        )
         self.preset_desc.setText(
             f"<b>{preset['label']}</b><br>"
             f"{preset['description']}<br><br>"
             f"<b>Settings:</b> "
             f"max_resolution={preset['max_resolution']}, "
             f"random_samples={preset['random_samples']}, "
-            f"estimated peak VRAM: {preset['est_peak_vram_gib']:.1f} GiB"
+            f"estimated peak VRAM: ~{live_peak:.0f} GiB (full pipeline)"
             f"{rec_line}"
         )
         self.preset_desc.setTextFormat(Qt.RichText)
@@ -299,10 +312,15 @@ class GenerateLocallyDialog(QDialog):
             return
         # Phase 2: VRAM probe needs the installed runtime to import torch.
         # Phase 3 will subprocess-call torch_runner to do the probe. For
-        # now show the estimated peak only, with a generic recommendation.
-        est = preset["est_peak_vram_gib"]
+        # now show the live full-pipeline estimate, with a generic
+        # recommendation.
+        est = estimate_full_pipeline_gib(
+            K=int(preset["random_samples"]),
+            bbox_local=True,
+            max_resolution=int(preset["max_resolution"]),
+        )
         self.vram_info.setText(
-            f"Estimated peak VRAM: <b>{est:.1f} GiB</b>. "
+            f"Estimated peak VRAM: <b>~{est:.0f} GiB</b> (full pipeline). "
             f"Make sure your card has at least that much FREE (close FH6 + "
             f"other GPU apps if tight). Phase 3 will probe your card "
             f"directly and warn before launch."
