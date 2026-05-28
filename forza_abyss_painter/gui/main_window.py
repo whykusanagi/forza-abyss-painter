@@ -1381,7 +1381,7 @@ class MainWindow(QMainWindow):
         from forza_abyss_painter.io.exporter import load_json as _load_json
         try:
             _polish_doc = _load_json(str(json_path))
-            _polish_w = int(_polish_doc.image_size[0]) if _polish_doc.image_size else 1200
+            _polish_w = int(max(_polish_doc.image_size)) if _polish_doc.image_size else 1200
         except Exception:
             _polish_w = 1200
         polish_preset = {
