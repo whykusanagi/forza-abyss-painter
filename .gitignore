@@ -47,6 +47,13 @@ Blue/
 # RE workshop notes — kept locally, not pushed
 memory*.md
 
+# Internal design/RE docs — local only, never committed
+# (closed upstream PR #23 on 2026-05-28 leaked these once; gitignore is the bound)
+docs/superpowers/
+docs/_*.md
+docs/JSON_SPEC.md
+docs/MULTISHAPE_FH6_RECON.md
+
 # Probe / RE scratch tooling and dumps
 probe_*.py
 probe_*.json
