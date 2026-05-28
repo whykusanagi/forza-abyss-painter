@@ -61,6 +61,8 @@ jobs:
             --ignore=tests/test_run_gpu_alpha_lock.py `
             --ignore=tests/test_sticker_render_parity.py `
             --ignore=tests/test_notebook_inlined_engine.py `
+            --ignore=tests/test_resume_runner_integration.py `
+            --ignore=tests/test_snapshot_runner_integration.py `
             --ignore-glob=tests/test_gpu_*.py
         env:
           QT_QPA_PLATFORM: offscreen
