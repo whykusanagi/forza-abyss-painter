@@ -212,15 +212,32 @@ _PROVIDED_IMPORTS = {
 
 
 def _strip_module(path: Path) -> str:
-    """Return a module's source with cross-package and already-provided imports removed."""
+    """Return a module's source with cross-package and already-provided imports removed.
+
+    Handles multi-line `from X import (` blocks: when an opening line matches a
+    strip rule AND ends with `(`, every continuation line up to and including the
+    closing `)` is also dropped. Without this, bare `name1, name2,` continuations
+    and the closing `)` survive as orphaned tokens at module scope and the
+    notebook cell tokenizes to an IndentationError. Surfaced when chunked-K
+    added `crop_score_ellipse_batch_chunked` to refill.py's import, wrapping it.
+    """
     out = []
+    in_stripped_multiline = False
     for ln in path.read_text().splitlines():
         s = ln.strip()
-        if s.startswith("from __future__"):
+        if in_stripped_multiline:
+            if s.endswith(")"):
+                in_stripped_multiline = False
             continue
-        if s.startswith("from forza_abyss_painter.shapegen.gpu"):
-            continue
-        if s.startswith("from dataclasses import") or s.startswith("from typing import"):
+        strip_this = (
+            s.startswith("from __future__")
+            or s.startswith("from forza_abyss_painter.shapegen.gpu")
+            or s.startswith("from dataclasses import")
+            or s.startswith("from typing import")
+        )
+        if strip_this:
+            if s.endswith("("):
+                in_stripped_multiline = True
             continue
         if s in _PROVIDED_IMPORTS:
             continue
