@@ -669,7 +669,11 @@ def _doc(shapes):
 # users can identify quality level at a glance — eg "my_image_3000.json" is a high-detail
 # render vs "my_image_400.json" for a lineart-density render. Budget is the planned shape
 # count even if the final actual count is slightly lower (sticker constraints can exhaust).
-_BUDGET_TAG = str(NUM_SHAPES)
+# Multi-shape EVAL variants append a "_shapes" suffix so running both an
+# ellipse-only variant AND a multi-shape variant on the same image leaves
+# both PNG/JSON pairs on disk side-by-side (the A/B cell in multi-shape
+# notebooks compares them). Ellipse-only runs keep the original naming.
+_BUDGET_TAG = str(NUM_SHAPES) + ("_shapes" if len(SHAPE_TYPES) > 1 else "")
 
 # Checkpoint to Drive during the run so a session reset mid-run still leaves a recoverable
 # JSON. Writes greedy progress every CHECKPOINT_EVERY shapes.
@@ -698,6 +702,93 @@ print(f"SAVED -> {png_path}")
 if len(shapes_json) < NUM_SHAPES:
     print(f"WARNING: only {len(shapes_json)} of {NUM_SHAPES} shapes committed (sticker constraint exhausted attempts)")
 '''
+
+# Inserted only into multi-shape EVAL notebooks. Loads the same-image
+# ellipse-only baseline PNG (if present) and compares against the
+# multi-shape render: RMS + SSIM vs source + a 1x4 figure
+# (source | ellipse | multi | absdiff). Needs the ellipse-only notebook
+# variant to have been run on the same image first; otherwise prints a
+# friendly hint and skips. Self-contained: no notebook-wide imports
+# beyond skimage (best-effort), so the rest of the notebook is unaffected
+# if scikit-image isn't installed in the Colab kernel.
+CELL_AB_COMPARE = '''# --- A/B: multi-shape vs ellipse-only on the same image ---
+# Looks for the ellipse-only run's PNG at <stem>_<NUM_SHAPES>_render.png
+# (this notebook's output landed at <stem>_<NUM_SHAPES>_shapes_render.png to
+# avoid clashing). If found, computes RMS + SSIM against the source for both
+# and displays a 1x4 grid: source | ellipse | multi-shape | absdiff.
+# To enable A/B: run fap_gpu_colab_medium_1000.ipynb (or another ellipse-only
+# variant matching this notebook's NUM_SHAPES) on the same image FIRST.
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image as _PILImage
+
+_ellipse_png = out_dir / f"{stem}_{NUM_SHAPES}_render.png"
+_multi_arr = final_canvas if final_canvas.shape[-1] == 3 else final_canvas[..., :3]
+
+if not _ellipse_png.exists():
+    print(f"No ellipse-only baseline at {_ellipse_png}.")
+    print()
+    print("To enable A/B comparison, run one of these ellipse-only notebooks on the")
+    print("SAME image first (matching this run's shape count), then re-run this cell:")
+    print(f"  - fap_gpu_colab_medium_1000.ipynb     (for NUM_SHAPES=1000)")
+    print(f"  - fap_gpu_colab_highres_3000.ipynb    (for NUM_SHAPES=3000)")
+else:
+    _src_arr = np.array(_PILImage.open(io.BytesIO(SOURCE_IMAGE_BYTES)).convert("RGB"))
+    _ellipse_arr = np.array(_PILImage.open(_ellipse_png).convert("RGB"))
+
+    # Resize source + ellipse to multi-shape canvas dims for direct comparison.
+    _th, _tw = _multi_arr.shape[:2]
+    def _resize(_a, _w, _h):
+        if _a.shape[:2] == (_h, _w):
+            return _a
+        return np.array(_PILImage.fromarray(_a).resize((_w, _h), _PILImage.LANCZOS))
+    _src_r = _resize(_src_arr, _tw, _th)
+    _ellipse_r = _resize(_ellipse_arr, _tw, _th)
+
+    def _rms(_a, _b):
+        return float(np.sqrt(np.mean((_a.astype(np.float32) - _b.astype(np.float32)) ** 2)))
+    _rms_e = _rms(_src_r, _ellipse_r)
+    _rms_m = _rms(_src_r, _multi_arr)
+
+    # SSIM via scikit-image. Pre-installed in Colab; degrade gracefully if not.
+    try:
+        from skimage.metrics import structural_similarity as _ssim
+        _ssim_e = float(_ssim(_src_r, _ellipse_r, channel_axis=2, data_range=255))
+        _ssim_m = float(_ssim(_src_r, _multi_arr, channel_axis=2, data_range=255))
+    except Exception as _exc:
+        print(f"(SSIM unavailable — {_exc.__class__.__name__}: {_exc})")
+        _ssim_e = _ssim_m = float("nan")
+
+    _fig, _axes = plt.subplots(1, 4, figsize=(22, 6))
+    _axes[0].imshow(_src_r); _axes[0].set_title("source"); _axes[0].axis("off")
+    _axes[1].imshow(_ellipse_r)
+    _axes[1].set_title(f"ellipse-only ({NUM_SHAPES})\\nRMS={_rms_e:.1f}  SSIM={_ssim_e:.3f}")
+    _axes[1].axis("off")
+    _axes[2].imshow(_multi_arr)
+    _axes[2].set_title(f"multi-shape ({len(shapes_json)})\\nRMS={_rms_m:.1f}  SSIM={_ssim_m:.3f}")
+    _axes[2].axis("off")
+    _diff = np.abs(_ellipse_r.astype(np.int16) - _multi_arr.astype(np.int16)).astype(np.uint8)
+    _axes[3].imshow(_diff); _axes[3].set_title("|multi - ellipse|"); _axes[3].axis("off")
+    plt.tight_layout(); plt.show()
+
+    print()
+    print(f"Metrics (lower RMS = closer to source; higher SSIM = closer):")
+    print(f"  ellipse-only: RMS={_rms_e:7.2f}  SSIM={_ssim_e:.4f}")
+    print(f"  multi-shape:  RMS={_rms_m:7.2f}  SSIM={_ssim_m:.4f}")
+    if not np.isnan(_rms_e) and not np.isnan(_ssim_e):
+        _drms = _rms_e - _rms_m       # >0 = multi closer to source
+        _dssim = _ssim_m - _ssim_e    # >0 = multi closer to source
+        _rms_better = "multi" if _drms > 0 else "ellipse"
+        _ssim_better = "multi" if _dssim > 0 else "ellipse"
+        print()
+        if _rms_better == _ssim_better:
+            print(f"  -> {_rms_better}-shape wins on BOTH metrics for this image "
+                  f"(RMS Δ={abs(_drms):.2f}, SSIM Δ={abs(_dssim):.4f}).")
+        else:
+            print(f"  -> Mixed: RMS prefers {_rms_better}, SSIM prefers {_ssim_better}.")
+            print(f"     Visual check the diff panel to decide.")
+'''
+
 
 # Inserted only into multi-shape EVAL notebooks. Counts how many shapes of
 # each kind landed in the final JSON so the reader can sanity-check that
@@ -874,6 +965,8 @@ def build(preset_key):
     if _is_multishape:
         cells.append(md("## 9.5 Shape-kind distribution\n\nReports how many shapes of each kind (ellipse / triangle / rotated_rectangle) actually landed in the output JSON. Helps catch the case where the gradient scorer prefers one kind so strongly that the others never get picked."))
         cells.append(code(CELL_SHAPE_DISTRIBUTION))
+        cells.append(md("## 9.6 A/B — multi-shape vs ellipse-only\n\nIf you've run the matching **ellipse-only** notebook (`fap_gpu_colab_medium_1000.ipynb` for NUM_SHAPES=1000, `fap_gpu_colab_highres_3000.ipynb` for NUM_SHAPES=3000) on the same image **first**, this cell loads its render and compares: side-by-side panels + RMS + SSIM against the source. If no baseline exists, it prints a hint and skips.\n\n**Output naming:** the multi-shape variant writes `<stem>_<NUM>_shapes.json` and `<stem>_<NUM>_shapes_render.png` so the two runs don't overwrite each other."))
+        cells.append(code(CELL_AB_COMPARE))
     cells.extend([
         md("## 10. View result"),
         code(CELL_DISPLAY),
