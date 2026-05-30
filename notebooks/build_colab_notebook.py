@@ -64,6 +64,9 @@ beyond the pre-installed Colab stack.
 3. Run the *Run* cell — it generates shapes and writes `<stem>_<NUM_SHAPES>.json`
    + `<stem>_<NUM_SHAPES>_render.png` so you can tell at a glance which budget tier this
    JSON belongs to (eg `my_image_3000.json` = high-detail vs `my_image_400.json` = lineart).
+   **Multi-shape EVAL variants** (`shapes_medium_1000`, `shapes_highres_3000`) append
+   `_shapes` to the budget tag so they don't clobber an ellipse-only run of the same image
+   — those land at `<stem>_<NUM_SHAPES>_shapes.json` / `<stem>_<NUM_SHAPES>_shapes_render.png`.
 4. The result is displayed inline. Download the JSON to ship to your Windows FH6 injector.
 
 **If you hit a CUDA OOM:** run the **Cleanup** cell (Section 3) and lower `RANDOM_SAMPLES`
