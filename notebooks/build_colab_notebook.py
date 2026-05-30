@@ -80,6 +80,49 @@ CELL_FOOTER = f"""<div align="center" style="margin-top: 32px; padding: 16px; bo
 </div>
 """
 
+# Inserted only into multi-shape EVAL notebooks (those whose preset's
+# `shape_types` is not just `["rotated_ellipse"]`). Sets reader expectations
+# about the FH6 shape_id_byte mapping confirmed by QUASAR 300-layer probes
+# (2026-05-27), the params we *assume* are ellipse-like, and the open
+# questions that still need recon before any of this output can be injected.
+CELL_MULTISHAPE_RECON_NOTE = """## 0. Multi-shape EVAL — what this notebook ships, what it doesn't
+
+This notebook generates a JSON mix of **ellipses + triangles + rotated rectangles** to evaluate whether richer shapes lift output quality on your image. The output is preview-only — **the FH6 injector cannot render triangles or rotated rectangles in-game yet.** It will silently degrade them. Don't ship the JSON to FH6 from this notebook; do ellipse-only runs (the other `fap_gpu_colab_*` notebooks) when you want an injectable result.
+
+### FH6 shape_id_byte mapping (confirmed)
+
+QUASAR 300-layer in-memory probes on RTX 5090 / FH6 UWP 3.360.259.0 (2026-05-27) pinned the per-type IDs at `layer + 0x7A`:
+
+| Shape type | `shape_id_byte` |
+|---|---|
+| Ellipse / circle | **102** |
+| Rectangle / square | **101** |
+| Equilateral triangle | **103** |
+| Right triangle | **104** |
+
+### Param encoding (working assumption)
+
+For position / rotation / color / mask, we treat every shape kind as **ellipse-like by default** until in-memory recon proves otherwise:
+
+| Field | Offset | Convention |
+|---|---|---|
+| Position | `+0x18` | `(x, -y)` f32 — Y negated. ✅ confirmed for ellipse + triangle (visual spread test). |
+| Scale | `+0x28` | ellipse: `(rx/63, ry/63)`. Rectangle: divisor `/127` per painter-fh6 inheritance, **unverified**. Triangle: scale field role unclear (vertex storage is the open question). |
+| Rotation | `+0x50` | `(360 - angle) % 360` f32 — negated. Confirmed for ellipse, **assumed same** for rect/triangle. |
+| Color | `+0x74` | 4× u8 RGBA, alpha forced to 255. Confirmed for ellipse, **assumed same**. |
+| Mask | `+0x78` | u8, always 0. Confirmed for ellipse, **assumed same**. |
+
+### Open recon questions (need QUASAR memory dumps to answer)
+
+- **Q4a** — Does the rectangle/triangle `scale` field really use the `/127` divisor inherited from painter-fh6? And for triangles, where do the 3 vertices actually live in memory?
+- **Q5** — Are rotation / color / mask byte layouts truly universal across IDs 101/103/104, or are some of them ellipse-only?
+- **Q6** — Is rotated_rectangle a distinct ID, or just rectangle (`101`) with non-zero rotation?
+
+These don't affect the JSON this notebook produces (we emit the shapes; the engine treats them as ellipse-encoded geometry internally). They affect whether the JSON would actually inject correctly. **Don't claim "FH6 rectangle/triangle support" until these are pinned in regression tests.**
+
+"""
+
+
 CELL_VRAM_AUTOPICKER = '''# --- VRAM check — am I in the right notebook for this GPU? ---
 # These notebooks target SERVER / ENTERPRISE GPUs (Colab T4 / V100 / L4 / A100,
 # datacenter H100, etc.). Consumer gaming-GPU users should use the EXE's
@@ -656,6 +699,35 @@ if len(shapes_json) < NUM_SHAPES:
     print(f"WARNING: only {len(shapes_json)} of {NUM_SHAPES} shapes committed (sticker constraint exhausted attempts)")
 '''
 
+# Inserted only into multi-shape EVAL notebooks. Counts how many shapes of
+# each kind landed in the final JSON so the reader can sanity-check that
+# the engine actually produced triangles + rectangles vs accidentally
+# falling back to ellipse-only on this image.
+CELL_SHAPE_DISTRIBUTION = '''# --- Shape-kind distribution in the output JSON ---
+# Sanity check: did each requested shape kind actually land in the output?
+# If you set SHAPE_TYPES=["rotated_ellipse", "triangle", "rotated_rectangle"]
+# and only ellipses survived, the gradient scorer is preferring them on
+# this image (common for round/organic subjects). For testing multi-shape
+# behavior, switch to a subject with strong straight edges (logos,
+# architecture, geometric art).
+from collections import Counter
+
+_kinds = Counter(s.get("type", "unknown") for s in shapes_json)
+_total = sum(_kinds.values())
+print(f"Shape kind distribution ({_total} shapes total):")
+print(f"  {'kind':<22} {'count':>7}  {'%':>6}")
+print(f"  {'-'*22} {'-'*7}  {'-'*6}")
+for _kind, _count in sorted(_kinds.items(), key=lambda kv: -kv[1]):
+    _pct = 100.0 * _count / max(1, _total)
+    print(f"  {_kind:<22} {_count:>7}  {_pct:5.1f}%")
+print()
+if len(_kinds) == 1:
+    print("NOTE: only one kind landed. If you requested multiple in SHAPE_TYPES,")
+    print("the gradient scorer is choosing this kind for this image. Try a")
+    print("subject with sharper edges to see triangle/rectangle pickup.")
+'''
+
+
 CELL_DISPLAY = '''# --- Display source vs render ---
 import matplotlib.pyplot as plt
 
@@ -762,19 +834,30 @@ else:
 def build(preset_key):
     preset = PRESETS[preset_key]
     out = ROOT / "notebooks" / f"fap_gpu_colab_{preset_key}.ipynb"
-    notebook = {
-        "cells": [
-            md(CELL_INTRO),
-            md(f"## Preset: **{preset['preset_label']}**\n\nThis variant ships tuned defaults for "
-               f"a {preset['num_shapes']}-shape budget. Edit any knob in the Configure cell."),
-            md("## 1. Setup — verify CUDA"),
-            code(CELL_SETUP_DEPS),
-            md("## 2. Setup — load the Forza Abyss Painter GPU engine\n\nRun this cell once per session. It defines `run_gpu(...)` and helpers."),
-            code(CELL_SETUP_ENGINE),
-            md("## 2.5 VRAM autopicker — **am I in the right notebook?**\n\nProbes free VRAM and whether FH6 is running locally. Prints a recommended notebook variant based on what your environment can support. If you're already in the right one, continue. If not, open the recommended one instead — same workflow, settings tuned for your card."),
-            code(CELL_VRAM_AUTOPICKER),
-            md("## 3. 🧹 Cleanup (run between attempts)\n\nUse this if a previous run OOM'd or you want to start fresh with different parameters. If `allocated` stays >1 GB after this cell, restart the runtime (Runtime → Restart runtime)."),
-            code(CELL_CLEANUP),
+    # Detect multi-shape EVAL variants: preset's shape_types is a JSON string
+    # like '["rotated_ellipse", "triangle", "rotated_rectangle"]'. If it parses
+    # to more than one type, this is a multi-shape variant and we inject the
+    # recon-note markdown + the shape-distribution code cell so readers see
+    # the FH6 shape_id_byte mapping AND can audit what actually landed.
+    _shape_types = json.loads(preset["shape_types"])
+    _is_multishape = len(_shape_types) > 1
+
+    cells = [
+        md(CELL_INTRO),
+        md(f"## Preset: **{preset['preset_label']}**\n\nThis variant ships tuned defaults for "
+           f"a {preset['num_shapes']}-shape budget. Edit any knob in the Configure cell."),
+    ]
+    if _is_multishape:
+        cells.append(md(CELL_MULTISHAPE_RECON_NOTE))
+    cells.extend([
+        md("## 1. Setup — verify CUDA"),
+        code(CELL_SETUP_DEPS),
+        md("## 2. Setup — load the Forza Abyss Painter GPU engine\n\nRun this cell once per session. It defines `run_gpu(...)` and helpers."),
+        code(CELL_SETUP_ENGINE),
+        md("## 2.5 VRAM autopicker — **am I in the right notebook?**\n\nProbes free VRAM and whether FH6 is running locally. Prints a recommended notebook variant based on what your environment can support. If you're already in the right one, continue. If not, open the recommended one instead — same workflow, settings tuned for your card."),
+        code(CELL_VRAM_AUTOPICKER),
+        md("## 3. 🧹 Cleanup (run between attempts)\n\nUse this if a previous run OOM'd or you want to start fresh with different parameters. If `allocated` stays >1 GB after this cell, restart the runtime (Runtime → Restart runtime)."),
+        code(CELL_CLEANUP),
             md("## 4. Mount Google Drive (persistent output)\n\n**This is the key cell for not losing results.** Outputs save straight to Drive the instant generation finishes, plus checkpoints during the run — so a session reset / disconnect can't lose your JSON + PNG. You'll be prompted to authorize Drive access."),
             code(CELL_MOUNT_DRIVE),
             md("## 5. Upload an image"),
@@ -785,14 +868,21 @@ def build(preset_key):
             code(cell_knobs(preset)),
             md("## 8. Resolution Planner — **decide MAX_RESOLUTION**\n\nShows the detail/VRAM/time tradeoff for your specific image + GPU, recommends the best fit, and **hard-stops if your chosen resolution would OOM**. Re-run the Knobs cell then this one until it says *Proceed to Run*."),
             code(CELL_RESOLUTION_PLANNER),
-            md("## 9. Run\n\nSaves the final JSON + PNG to Drive the moment it finishes (and checkpoints every `CHECKPOINT_EVERY` shapes). Progress prints every 50 shapes."),
-            code(CELL_RUN),
-            md("## 10. View result"),
-            code(CELL_DISPLAY),
-            md("## 11. (Optional) browser download\n\nYour files are already on Drive. This just pushes a local copy to your browser too — safe to skip, and it won't matter if the session later resets."),
-            code(CELL_DOWNLOAD),
-            md(CELL_FOOTER),
-        ],
+        md("## 9. Run\n\nSaves the final JSON + PNG to Drive the moment it finishes (and checkpoints every `CHECKPOINT_EVERY` shapes). Progress prints every 50 shapes."),
+        code(CELL_RUN),
+    ])
+    if _is_multishape:
+        cells.append(md("## 9.5 Shape-kind distribution\n\nReports how many shapes of each kind (ellipse / triangle / rotated_rectangle) actually landed in the output JSON. Helps catch the case where the gradient scorer prefers one kind so strongly that the others never get picked."))
+        cells.append(code(CELL_SHAPE_DISTRIBUTION))
+    cells.extend([
+        md("## 10. View result"),
+        code(CELL_DISPLAY),
+        md("## 11. (Optional) browser download\n\nYour files are already on Drive. This just pushes a local copy to your browser too — safe to skip, and it won't matter if the session later resets."),
+        code(CELL_DOWNLOAD),
+        md(CELL_FOOTER),
+    ])
+    notebook = {
+        "cells": cells,
         "metadata": {
             "accelerator": "GPU",
             "colab": {"name": out.name, "provenance": [], "toc_visible": True},
