@@ -267,9 +267,25 @@ def _inline_package_engine() -> str:
     # logged for (`name 'clean_and_refill' is not defined` after a 10-minute greedy run).
     # Inline order matters: each module's source is concatenated raw, so anything `engine`
     # references must be inlined before `engine`.
+    #
+    # vram_planner is pure Python (math only, no torch). engine.py imports
+    # `resolve_k_chunk_size as _resolve_k_chunk_size` from it; refill.py re-imports the
+    # renamed symbol from engine. Both use the rename inside their function bodies, so
+    # after _strip_module drops the imports we must synthesize the alias once at module
+    # scope (see _RESOLVE_K_CHUNK_SIZE_ALIAS below). vram_planner is inlined BEFORE
+    # engine so resolve_k_chunk_size is in scope when the alias line runs.
     for name in ["device", "rasterize", "scoring", "shapes_gpu", "bbox_score",
-                 "joint_polish", "refill", "engine"]:
+                 "vram_planner", "joint_polish", "refill", "engine"]:
         parts.append(f"# ----- {name}.py -----\n" + _strip_module(GPU_PKG / f"{name}.py"))
+        if name == "vram_planner":
+            parts.append(
+                "# Re-export the rename that engine.py + refill.py rely on. The original\n"
+                "# `from ... import resolve_k_chunk_size as _resolve_k_chunk_size` was\n"
+                "# stripped along with every other cross-package import; without this\n"
+                "# alias the engine cell raises NameError: _resolve_k_chunk_size at the\n"
+                "# first call into the chunked-K scorer.\n"
+                "_resolve_k_chunk_size = resolve_k_chunk_size"
+            )
     parts.append('DEVICE = get_device()\nprint(f"Engine loaded on {DEVICE}. Ready for image upload.")')
     return "\n\n".join(parts)
 
